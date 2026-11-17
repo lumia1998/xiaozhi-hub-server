@@ -120,6 +120,15 @@ async def startToChat(conn: "ConnectionHandler", text, gen=None):
     if actual_text is None:
         return
 
+    if getattr(conn, 'last_choice_id', None):
+        from core.agent.choice_cards import voice_selection
+        result = await asyncio.to_thread(voice_selection, conn, actual_text)
+        conn.last_choice_id = None
+        if result:
+            actual_text = result['text']
+            await conn.websocket.send(json.dumps({'type': 'choice_result', 'ok': True, 'id': result['id'],
+                'selected': result['selected'], 'session_id': conn.session_id}))
+
     # 明确的单设备家居指令直接执行；歧义、条件、复合或上下文表达继续走模型。
     if await pre_llm.handle(conn, actual_text, gen):
         return

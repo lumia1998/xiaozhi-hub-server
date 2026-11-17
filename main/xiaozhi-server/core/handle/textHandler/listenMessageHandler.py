@@ -1,6 +1,7 @@
 import time
 import uuid
 import asyncio
+import json
 from typing import Dict, Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -27,6 +28,23 @@ class ListenTextMessageHandler(TextMessageHandler):
         return TextMessageType.LISTEN
 
     async def handle(self, conn: "ConnectionHandler", msg_json: Dict[str, Any]) -> None:
+        if msg_json.get('state') == 'detect' and 'choice' in msg_json:
+            from core.agent import choice_cards
+            selection = msg_json['choice']
+            request_id = selection.get('id') if isinstance(selection, dict) else None
+            try:
+                if not isinstance(selection, dict):
+                    raise ValueError('选择参数无效')
+                result = await asyncio.to_thread(choice_cards.select, conn, request_id, selection.get('option_id'))
+                await conn.websocket.send(json.dumps({'type': 'choice_result', 'id': request_id,
+                    'ok': True, 'selected': result['selected'], 'session_id': conn.session_id}))
+                if result['duplicate']:
+                    return
+                msg_json = {**msg_json, 'text': result['text']}
+            except ValueError as error:
+                await conn.websocket.send(json.dumps({'type': 'choice_result', 'id': request_id,
+                    'ok': False, 'error': str(error), 'session_id': conn.session_id}))
+                return
         if "mode" in msg_json:
             conn.client_listen_mode = msg_json["mode"]
             conn.logger.bind(tag=TAG).debug(

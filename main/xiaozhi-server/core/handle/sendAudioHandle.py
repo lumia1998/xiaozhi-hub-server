@@ -312,6 +312,9 @@ async def send_tts_message(conn: "ConnectionHandler", state, text=None):
     if text is None and state == "sentence_start":
         return
     message = {"type": "tts", "state": state, "session_id": conn.session_id}
+    message['sentence_id'] = conn.sentence_id
+    if getattr(conn, 'rich_text_sid', None) == conn.sentence_id:
+        message['display_text'] = False
     if text is not None:
         message["text"] = textUtils.check_emoji(text)
 
