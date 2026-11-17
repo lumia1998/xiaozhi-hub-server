@@ -1,131 +1,157 @@
-<p align="center">
-  <picture>
-    <source srcset="hub-docs/images/logo-dark.svg" media="(prefers-color-scheme: dark)">
-    <source srcset="hub-docs/images/logo-light.svg" media="(prefers-color-scheme: light)">
-    <img src="hub-docs/images/logo-light.svg" alt="xiaozhi-hub-server">
-  </picture>
-</p>
-<p align="center">让小智设备成为 AI 的语音中枢：叫谁的名字，就交给谁干活。</p>
-<p align="center">
-  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/justhalfbit/xiaozhi-hub-server?style=flat-square" /></a>
-  <img alt="Python" src="https://img.shields.io/badge/python-3.10-3776ab?style=flat-square" />
-  <img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-64748b?style=flat-square" />
-  <a href="https://github.com/justhalfbit/xiaozhi-hub-server/stargazers"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/justhalfbit/xiaozhi-hub-server?style=flat-square" /></a>
-  <a href="https://x.com/justhalfbit"><img alt="X (Twitter)" src="https://img.shields.io/badge/X-%40justhalfbit-000000?style=flat-square&logo=x&logoColor=white" /></a>
-</p>
-<p align="center">
-  <a href="README.md">简体中文</a> |
-  <a href="README.en.md">English</a>
-</p>
-<p align="center">
-  <a href="hub-docs/guide.md">使用说明</a> · <a href="hub-docs/design.md">设计细节</a>
-</p>
+# Xiaozhi Hub Server
 
-[![管理后台](hub-docs/images/admin.png)](hub-docs/guide.md)
+面向小智协议设备和 Ubuntu ThinkSmart 带屏音箱的 AI 语音服务端。Hub 负责语音识别、模型与工具调用、语音合成、聊天记忆、后台任务和视觉分析。
 
----
+配套设备客户端为 [xiaozhi-thinksmart-client](https://github.com/lumia1998/xiaozhi-thinksmart-client)。
 
-小智设备（M5Stack StackChan、ESP32 开发板等）的**中枢网关**。设备负责听和说；网关负责识别和合成语音，再按你叫的名字，把话交给对应的 agent 或大模型去干活。
-
-- **部署在自己的电脑上**：可以直接让本机的 Claude Code 干活，也可以用各家大模型的 API。
-- **部署在云端服务器上**：用不了本机的 Claude Code，改用大模型的 API。
-
+```text
+ThinkSmart / 小智协议设备
+        ⇅ WebSocket JSON + Opus
+Hub 语音与会话服务
+        ⇅ Pi Agent、设备 MCP、服务端工具
+模型服务 / 视觉模型 / 外部应用
 ```
-小智设备   ⇄   xiaozhi-hub-server        ⇄   Claude Code / 大模型 API / …
-听和说          识别、按称呼分派、合成语音       思考和干活
-```
-
-> 兼容小智协议的社区项目，不是小智官方项目。
 
 ## 功能
 
-**一个设备，多个 AI**
+| 功能 | 当前实现 |
+| --- | --- |
+| 语音对话 | 可配置 ASR、VAD、TTS 提供商，流式音频发送和打断处理 |
+| 模型服务 | 管理接口地址与凭据、获取模型列表、检测协议、选择默认模型和配置人设 |
+| 多模型会话 | 按称呼切换模型，按设备与模型保存对话，维护上下文窗口 |
+| 工具调用 | Pi Agent 对话循环、设备 MCP、服务端 MCP、插件及模型前置处理 |
+| 设备控制 | 调用客户端公开的音量、亮度、定时亮度及摄像头工具 |
+| 视觉分析 | 接收图片与问题，通过配置的视觉提供商返回识别文字 |
+| 多媒体输出 | 为支持媒体协议的设备提供 `show_media` 工具，发送图片、视频和音频直链 |
+| 记忆 | 对话持久化、摘要、用户偏好，以及按需调用的共享记忆接入 |
+| 后台任务 | 任务提交、状态查询、取消、补充回答及结果投递 |
+| 管理后台 | 模型、音色、插件、会话、记忆、任务、设备配对和运行状态 |
 
-- **叫名字换 AI**：说"嗨 Claude"交给 Claude Code，说"嗨 DeepSeek"交给 DeepSeek，称呼在管理后台配。每个 AI 各聊各的，每台设备记得上次用的是哪个。
-- **Claude Code**：用你在本机登录的账号干活，比如"把这周的笔记整理成一份清单"。
-- **大模型 API**：Claude、OpenAI、Gemini、DeepSeek、通义千问、豆包、智谱 GLM、Kimi，以及任意 OpenAI 兼容接口。
-- **Grok Bot**：给 xAI 的云端 AI 同事派活。在后台用 Cursor 账号登录、勾选 Bot、配上称呼，说"嗨 孙悟空，帮我把这周的 X 热点整理一下"，它的回复会念出来。长任务可以打断不等，它在云端做完后设备会主动汇报。走的是 App 用的内部接口，不是官方 API，App 升级后可能失效。
-- **更多 agent**：Codex 在规划中。网关里的 agent 都走同一套会话接口，接入新的 agent 主要就是实现这套接口。
+模型服务支持检测 OpenAI Chat Completions、OpenAI Responses、Gemini 和 Claude 协议，实际可用能力取决于所配置的接口与模型。说明见 [模型服务与人设](hub-docs/model-services.md)。
 
-**长任务也能陪着做**
+## 运行环境
 
-- **陪着等**：让 Claude Code 做几分钟的任务，设备一直陪着，隔一会儿报一下进度，做完当场说结果。
-- **随时打断**：设备说话时按一下设备上的按键（StackChan 是点一下屏幕上的脸），或者喊唤醒词，它马上停下。
-- **接着上次聊**：断线重连自动接上；隔得久了，说"接着上次聊"也能接回去（Claude Code）。
+生产部署以 Linux 为主。核心服务使用 Python，Pi Agent 运行时需要 Node.js **22.19 或以上版本**。音频链路依赖系统 FFmpeg、libopus 及所选提供商的运行组件，离线 ASR 还需对应模型文件。
 
-**听得准**
+仓库保留 macOS/Linux 与 Windows 安装脚本。测试环境与生产虚拟环境分别管理，详见 [test/README.md](test/README.md)。
 
-- 中英夹杂也能认对：默认用离线运行的 X-ASR，"帮我跑一下 npm install"也能认准；认错的词可以加进热词和纠错表。也可以换成豆包流式识别。
+## 安装与启动
 
-**管理后台**
+### 1. 获取代码并准备基础环境
 
-- 在网页上配置大模型和 API Key、Claude Code 的权限、称呼、插件、热词纠错和音色，查看在线设备和环境自检。
-
-## 快速开始
-
-开始前：电脑和设备连在同一个局域网，电脑上装好 git。要用 Claude Code 的话，先装好它并在终端运行一次 `claude` 登录；没装时会改用 Claude API，到管理后台填 API Key 就行。
-
-### 1. 安装
-
-**macOS / Linux**，在终端运行：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/justhalfbit/xiaozhi-hub-server/main/scripts/bootstrap.sh | bash
-```
-
-代码装到 `~/xiaozhi-hub-server`，结束时询问是否开机自启（直接回车就是开启）。macOS 缺 ffmpeg、opus 时会用 [Homebrew](https://brew.sh) 安装，这种情况要先装好 Homebrew。
-
-**Windows 10 / 11**，在 PowerShell 里运行：
-
-```powershell
-git clone --depth 1 https://github.com/justhalfbit/xiaozhi-hub-server.git
+```sh
+git clone https://github.com/lumia1998/xiaozhi-hub-server.git
 cd xiaozhi-hub-server
-powershell -ExecutionPolicy Bypass -File scripts\install.ps1   # 安装
-powershell -ExecutionPolicy Bypass -File scripts\start.ps1     # 启动
+bash scripts/install.sh
 ```
 
-第一次启动时 Windows 防火墙会询问，请勾选"专用网络"并允许，否则设备连不上。Windows 暂时没有开机自启，每次开机后运行一次 `start.ps1`。
+安装脚本准备 Python 环境、基础依赖、默认语音识别模型及初始配置。已有配置会保留。Windows 对应入口为 `scripts/install.ps1` 和 `scripts/start.ps1`。
 
-不想用 `curl | bash`、下载太慢或者想看装了什么，见[使用说明 · 安装](hub-docs/guide.md#1-安装)。
+### 2. 准备 Pi 运行时
 
-### 2. 设置管理密码
+安装 Node.js 22.19 或以上版本后执行
 
-装好后尽快在这台电脑的浏览器里打开 `http://127.0.0.1:16688/admin`（其他电脑用 `http://<电脑的局域网 IP>:16688/admin`），第一次使用时先设置管理密码。在你设置之前，局域网里谁先打开后台谁就能设置。
-
-### 3. 连接设备
-
-设备配网时，在配网页的"高级选项"里填 OTA 地址：
-
-```
-http://<电脑的局域网 IP>:16688/xiaozhi/ota/
+```sh
+npm ci --omit=dev --omit=optional --prefix main/xiaozhi-server/core/providers/llm/pi/runtime
 ```
 
-StackChan 的配网步骤、怎么跟设备说话，见[使用说明](hub-docs/guide.md#3-连接设备)。
+### 3. 配置并启动
 
-**部署到云端服务器**：只建议在局域网里用；要装在云服务器上，请让设备和服务器走 Tailscale、WireGuard 这类私人组网，不要把端口放行到公网，见[使用说明 · 部署到云端服务器](hub-docs/guide.md#部署到云端服务器)。
+运行配置位于 `main/xiaozhi-server/data/.config.yaml`，与仓库默认 `config.yaml` 合并使用。启动入口为
 
-## 更新与卸载
+```sh
+bash scripts/start.sh
+```
 
-| | macOS / Linux | Windows |
-| --- | --- | --- |
-| 更新 | `bash ~/xiaozhi-hub-server/scripts/update.sh` | 在项目目录里 `git pull`，再运行一次 `install.ps1` |
-| 卸载 | `bash ~/xiaozhi-hub-server/scripts/uninstall.sh` | 运行 `scripts\uninstall.ps1`，注意事项见[使用说明](hub-docs/guide.md#卸载) |
+也可在已准备好的运行环境中直接启动
 
-手动下载的，把 `~/xiaozhi-hub-server` 换成自己的目录。开机自启的开关、卸载会删什么，见[使用说明 · 开机自启、更新与卸载](hub-docs/guide.md#7-开机自启更新与卸载)。
+```sh
+cd main/xiaozhi-server
+.venv/bin/python app.py
+```
 
-## 安全提示
+打开 `http://127.0.0.1:16688/admin` 设置管理员密码，在“大模型”页面添加模型服务、检测协议并选择默认模型，再配置 ASR 和 TTS。安装脚本生成的初始模型项需要结合实际凭据调整。
 
-- 只在可信的局域网内使用，不要把 `16688`、`16689` 端口暴露到公网；要远程用（包括部署到云端服务器），走 Tailscale、WireGuard 这类私人组网。
-- 语音连接（`16689` 端口）实际上不认证，只认设备自己报的设备号。同一局域网的人不需要设备就能冒充设备号连上来：使用你的模型、读写这台设备的聊天记录和记忆、指挥 Claude Code 和 Grok Bot。
-- 服务启动后尽快打开管理后台，设置足够强的管理密码；在你设置之前，局域网里谁先打开后台谁就能设置。
-- Claude Code 默认只能读取工作目录 `~/xiaozhi-workspace` 里的文件。在管理后台放开写文件、执行命令后，语音指令就能修改文件、执行命令，请谨慎；其中执行命令（Auto 级别）不受工作目录限制。
+## 连接设备
 
-## 关于本仓库
+| 地址 | 用途 |
+| --- | --- |
+| `http://<Hub 地址>:16688/admin` | 管理后台 |
+| `http://<Hub 地址>:16688/xiaozhi/ota/` | 小智固件 OTA 与连接信息 |
+| `ws://<Hub 地址>:16689/xiaozhi/v1/` | 语音 WebSocket |
+| `http://<Hub 地址>:16688/mcp/vision/explain` | 带认证的图片视觉分析 |
 
-本项目只用到 `main/xiaozhi-server`、`scripts/` 和 `hub-docs/`。其余目录是上游 [xiaozhi-esp32-server](https://github.com/xinnan-tech/xiaozhi-esp32-server) 的原样代码，本项目不使用，保留它们是为了定期合并上游时少出冲突，好跟上小智固件的更新；一键安装不会下载这些目录。
+ThinkSmart 客户端可在设置页填写 HTTP 地址和 WebSocket 地址。启用 `server.auth.device_auth.enabled` 后，需要使用后台签发的设备配对令牌，客户端通过 `X-Device-Pairing-Token` 提交。配对与 HMAC 认证是否强制执行由运行配置决定。
 
-想了解一句话从唤醒到回答经过了什么，看[设计细节](hub-docs/design.md)，或者管理后台的"工作原理"页。
+`/kiosk/*` 为本机来源限制接口，用于模型选择、历史记录及部分辅助功能。分开部署客户端与 Hub 时，这些接口需要部署层提供受控的本机转发，普通局域网直连会收到 403。语音 WebSocket 和视觉上传使用各自的连接与认证流程。
 
-## 许可
+## 图片、视频与摄像头
 
-[MIT License](LICENSE)。基于 [xinnan-tech/xiaozhi-esp32-server](https://github.com/xinnan-tech/xiaozhi-esp32-server)（MIT）改造，第三方组件的致谢见[使用说明](hub-docs/guide.md#致谢与许可)。
+### 向设备展示媒体
+
+设备通过 `hello.features.media` 声明能力后，Hub 向模型开放 `show_media`。工具接收 `image`、`video`、`audio` 类型及可访问的 HTTP(S) 直链，通过 JSON 消息交给客户端展示或播放。
+
+媒体结果随工具历史持久化，设备读取聊天记录时可恢复媒体条目。客户端负责资源加载、播放控制及解码，资源链接的有效期由来源服务决定。详细消息格式见 [媒体输出协议](hub-docs/media-output.md)。
+
+### 查看摄像头画面
+
+支持摄像头的客户端注册 `self.camera.take_photo`。用户提出“看看前面是什么”“读一下眼前文字”等请求时，模型调用设备工具，客户端按需采集图片，使用 MCP 初始化下发的视觉令牌上传，再将识别结果返回对话。
+
+Hub 视觉配置示例
+
+```yaml
+selected_module:
+  VLLM: CameraVision
+
+VLLM:
+  CameraVision:
+    type: openai
+    model_name: your-vision-model
+    base_url: https://api.example.com/v1
+    api_key: your-api-key
+```
+
+将示例字段合并到已有配置并填入实际视觉模型。该接口接受问题和图片的 multipart 上传，图片上限为 5 MB。ThinkSmart 的摄像头驱动、设备树和 libcamera 属于设备系统层依赖。
+
+## 数据与配置
+
+| 路径 | 用途 |
+| --- | --- |
+| `main/xiaozhi-server/data/.config.yaml` | 私有运行配置及模型服务设置 |
+| `main/xiaozhi-server/data/chat.db` | 聊天、记忆及相关持久化数据 |
+| `main/xiaozhi-server/data/device_auth.db` | 设备配对记录 |
+| `main/xiaozhi-server/core/agent/` | 对话循环、记忆、任务和模型路由 |
+| `main/xiaozhi-server/core/providers/` | 模型、音频与工具提供商 |
+| `main/xiaozhi-server/core/admin/` | 管理后台及接口 |
+| `test/` | 测试、独立依赖清单和隔离配置 |
+
+私有配置、数据库、令牌、日志及测试缓存应保存在各自部署环境中。备份时保留私有配置和数据库，升级后重启实际部署所使用的服务。
+
+## 测试
+
+在仓库根目录执行
+
+```sh
+python3 -m venv test/.venv
+test/.venv/bin/python -m pip install -r test/requirements.txt
+PYTHONDONTWRITEBYTECODE=1 test/.venv/bin/python -m pytest -c test/pytest.ini -q
+node --test test/test_models_page_state.cjs
+```
+
+默认测试使用隔离配置和模拟外部服务。真实 API 测试通过 `RUN_LIVE_API_TESTS=1` 启用，Pi 集成测试的运行时准备步骤见 [测试说明](test/README.md)。
+
+## 文档
+
+- [模型服务与人设](hub-docs/model-services.md)
+- [语音合成提供商](hub-docs/tts-providers.md)
+- [模型前置处理](hub-docs/pre-llm-hooks.md)
+- [媒体输出协议](hub-docs/media-output.md)
+- [ThinkSmart 客户端](https://github.com/lumia1998/xiaozhi-thinksmart-client)
+
+`hub-docs/guide.md`、`hub-docs/design.md` 和英文旧版说明保留了早期架构背景，当前功能与入口以本页及对应专项文档为准。
+
+## 来源与许可
+
+[MIT License](LICENSE)。基于 [justhalfbit/xiaozhi-hub-server](https://github.com/justhalfbit/xiaozhi-hub-server) 和 [xinnan-tech/xiaozhi-esp32-server](https://github.com/xinnan-tech/xiaozhi-esp32-server) 继续开发。
+
+核心运行目录为 `main/xiaozhi-server`。仓库同时保留上游管理端、数字人及其他组件，使用这些组件时请查阅对应目录的说明。

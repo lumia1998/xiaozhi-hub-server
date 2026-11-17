@@ -1,6 +1,8 @@
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
+testpaths = ["../../test"]
+pythonpath = ["../..", "."]
+cache_dir = "../../test/.pytest_cache"
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]

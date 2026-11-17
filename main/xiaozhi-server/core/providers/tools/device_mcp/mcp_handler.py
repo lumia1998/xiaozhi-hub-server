@@ -383,9 +383,10 @@ async def call_mcp_tool(
 
         if isinstance(raw_result, dict):
             if raw_result.get("isError") is True:
-                error_msg = raw_result.get(
-                    "error", "工具调用返回错误，但未提供具体错误信息"
-                )
+                error_msg = raw_result.get("error") or "；".join(
+                    str(block.get("text", "")) for block in raw_result.get("content", [])
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ) or "工具调用返回错误，但未提供具体错误信息"
                 raise RuntimeError(f"工具调用错误: {error_msg}")
 
             content = raw_result.get("content")

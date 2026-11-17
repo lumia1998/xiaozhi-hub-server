@@ -1,4 +1,5 @@
 import json
+import asyncio
 import copy
 from aiohttp import web
 from config.logger import setup_logging
@@ -127,7 +128,7 @@ class VisionHandler(BaseHandler):
                 vllm_type, current_config["VLLM"][select_vllm_module]
             )
 
-            result = vllm.response(question, image_base64)
+            result = await asyncio.to_thread(vllm.response, question, image_base64)
 
             return_json = {
                 "success": True,
