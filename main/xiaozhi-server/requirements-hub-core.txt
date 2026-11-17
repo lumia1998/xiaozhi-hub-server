@@ -35,4 +35,5 @@ edge_tts
 # 插件：plugins_func/functions 在启动时全部导入，缺任何一个都会启动失败
 bs4
 markitdown
+Pillow>=11.3,<13
 cnlunar

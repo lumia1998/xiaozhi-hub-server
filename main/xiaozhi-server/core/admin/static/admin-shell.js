@@ -1,6 +1,6 @@
 (() => {
   const icon = name => `<svg class="ui-icon" aria-hidden="true"><use href="/admin/assets/admin-icons.svg#${name}"></use></svg>`;
-  const names={status:'layout-dashboard',llm:'brain',skills:'book',mcp:'plug',calls:'phone',memory:'history',tasks:'list-checks',asr:'microphone',tts:'volume',intent:'settings',how:'route'};
+  const names={status:'layout-dashboard',llm:'brain',skills:'book',mcp:'plug',stickers:'robot',calls:'phone',memory:'history',tasks:'list-checks',asr:'microphone',tts:'volume',intent:'settings',how:'route'};
   document.querySelectorAll('#nav [data-page]').forEach(b=>{b.querySelector('.ico').innerHTML=icon(names[b.dataset.page]);});
   document.querySelectorAll('.logo').forEach(el=>el.innerHTML=icon('robot'));
   $('nav-toggle').innerHTML=icon('menu-2');

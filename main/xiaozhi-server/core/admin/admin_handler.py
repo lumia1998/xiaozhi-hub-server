@@ -26,7 +26,7 @@ from aiohttp import web
 from config.logger import setup_logging
 from core.admin import auth, catalog, config_store, connections, pages, pipeline, plugin_settings, tts_settings
 from core.admin import model_services
-from core.agent import extensions
+from core.agent import extensions, stickers
 from core.admin.status import collect_status
 from core.agent import chat_history, llm_router, task_service
 from core.device_pairing import PairingError
@@ -85,6 +85,8 @@ class AdminHandler:
         self._model_management_lock = asyncio.Lock()
         self._mcp_probe_slots = asyncio.Semaphore(2)
         self.extensions_path = data_dir / 'llm_extensions.json'
+        self.stickers = stickers.StickerStore(data_dir / 'stickers.db')
+        self._sticker_annotation_slots = asyncio.Semaphore(1)
 
     def register(self, app: web.Application) -> None:
         app.add_routes(
@@ -122,6 +124,11 @@ class AdminHandler:
                 web.get('/admin/api/extensions', self.handle_extensions),
                 web.post('/admin/api/extensions', self.handle_extensions_save),
                 web.post('/admin/api/extensions/probe', self.handle_extensions_probe),
+                web.get('/admin/api/stickers', self.handle_stickers),
+                web.post('/admin/api/stickers/save', self.handle_stickers_save),
+                web.post('/admin/api/stickers/delete', self.handle_stickers_delete),
+                web.post('/admin/api/stickers/annotate', self.handle_stickers_annotate),
+                web.get('/media/stickers/{id}', self.handle_sticker_image),
                 web.get("/admin/api/pipeline", self.handle_pipeline),
                 web.get("/admin/api/asr", self.handle_asr),
                 web.post("/admin/api/vad", self.handle_vad_save),
@@ -208,7 +215,7 @@ class AdminHandler:
     async def handle_asset(self, request: web.Request):
         name = request.match_info['name']
         if name not in ('tts-page.js', 'tts-page.css', 'models-page.js', 'models-page.css',
-                        'extensions-page.js', 'memory-page.js', 'task-page.js', 'admin-shell.js', 'admin-theme.css', 'admin-icons.svg', 'radix-colors.css'):
+                        'extensions-page.js', 'stickers-page.js', 'stickers-page.css', 'memory-page.js', 'task-page.js', 'admin-shell.js', 'admin-theme.css', 'admin-icons.svg', 'radix-colors.css'):
             raise web.HTTPNotFound()
         return web.FileResponse(STATIC_DIR / name, headers=SECURITY_HEADERS)
 
@@ -538,6 +545,61 @@ class AdminHandler:
             return self._json(result, 200 if result['ok'] else 400)
         except (ValueError, TypeError) as e:
             return self._error(str(e), 400)
+
+    async def handle_stickers(self, request):
+        self._require_login(request)
+        return self._json({'items': await self._blocking(self.stickers.list)})
+
+    async def handle_stickers_save(self, request):
+        self._require_login(request)
+        # Limit the larger upload body to this JSON-only endpoint.
+        body = await self._read_json(request.clone(client_max_size=8 * 1024 * 1024))
+        try:
+            sid = await self._blocking(self.stickers.save, body)
+            return self._json({'ok': True, 'id': sid, 'items': await self._blocking(self.stickers.list)})
+        except ValueError as error:
+            return self._error(str(error), 400)
+
+    async def handle_stickers_delete(self, request):
+        self._require_login(request)
+        body = await self._read_json(request)
+        try:
+            await self._blocking(self.stickers.delete, body.get('id'), body.get('version'))
+            return self._json({'ok': True, 'items': await self._blocking(self.stickers.list)})
+        except ValueError as error:
+            return self._error(str(error), 400)
+
+    async def handle_stickers_annotate(self, request):
+        self._require_login(request)
+        if self._sticker_annotation_slots.locked():
+            return self._error('正在生成标签，请稍后重试', 429)
+        body = await self._read_json(request.clone(client_max_size=8 * 1024 * 1024))
+        async with self._sticker_annotation_slots:
+            try:
+                encoded = body.get('image')
+                if not encoded and body.get('id'):
+                    import base64
+                    row = await self._blocking(self.stickers.get, body['id'])
+                    if row is None:
+                        return self._error('该表情已删除', 404)
+                    encoded = base64.b64encode(row['image']).decode('ascii')
+                config = await self._blocking(self._merged)
+                result = await self._blocking(stickers.annotate, config, encoded)
+                return self._json({'ok': True, **result})
+            except ValueError as error:
+                return self._error(str(error), 400)
+            except Exception:
+                return self._error('自动打标失败，请检查视觉模型配置或手动填写', 502)
+
+    async def handle_sticker_image(self, request):
+        # Opaque asset URLs can be loaded by paired screens without an admin cookie.
+        try:
+            row = await self._blocking(self.stickers.get, request.match_info['id'])
+        except ValueError:
+            raise web.HTTPNotFound()
+        if row is None:
+            raise web.HTTPNotFound()
+        return web.Response(body=row['image'], content_type=row['mime'], headers=SECURITY_HEADERS)
 
     # ---------- 本机设备接口 ----------
 

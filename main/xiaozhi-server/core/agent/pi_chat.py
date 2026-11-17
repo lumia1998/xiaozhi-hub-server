@@ -5,7 +5,7 @@ import json
 import time
 from concurrent.futures import TimeoutError as FutureTimeout
 
-from core.agent import assistant_tools, chat_history, extensions, llm_router, media_output
+from core.agent import assistant_tools, chat_history, extensions, llm_router, media_output, stickers
 from core.handle.reportHandle import enqueue_tool_report
 from core.providers.tts.dto.dto import ContentType, SentenceType, TTSMessageDTO
 from core.utils import reply_progress
@@ -35,15 +35,25 @@ def chat(conn, query, sentence_id):
     markup=ToolMarkupFilter();spoken=[];direct=[]
     started=time.monotonic()
     media_sent = False
+    sticker_sent = False
 
     def speak(text):
         if text and not stale():
             spoken.append(text);enqueue(text)
 
     def tool(event):
-        nonlocal media_sent
+        nonlocal media_sent, sticker_sent
         if stale():return {'text':'本轮已取消','error':True,'terminate':True}
         name,args,call_id=event['name'],event['arguments'],event['call_id']
+        if name == stickers.SEARCH_TOOL_NAME:
+            return stickers.search(args)
+        if name == stickers.TOOL_NAME:
+            if sticker_sent:
+                return {'text': '本轮已经发送过表情，请继续回答。', 'error': False, 'terminate': False}
+            result = stickers.execute(conn, args, call_id, sentence_id, stale)
+            sticker_sent = sticker_sent or not result.get('error', True)
+            media_sent = media_sent or sticker_sent
+            return result
         if name == media_output.TOOL_NAME:
             result = media_output.execute(conn, args, call_id, sentence_id, stale)
             media_sent = media_sent or not result.get('error', True)
@@ -97,6 +107,7 @@ def chat(conn, query, sentence_id):
         functions=assistant_tools.definitions(conn)
         if media_output.supported(conn):
             functions.append(media_output.DEFINITION)
+        functions.extend(stickers.definitions(conn))
         if conn.intent_type=='function_call' and conn.func_handler:
             ready=getattr(conn.func_handler,'ready',None)
             # Bounded readiness, checking cancellation rather than blocking a worker for 65s.
@@ -106,7 +117,7 @@ def chat(conn, query, sentence_id):
                 ready.wait(.1)
             external=conn.func_handler.get_functions()
             functions.extend(f for f in external
-                             if ((f.get('function') or {}).get('name') not in assistant_tools.RESERVED | assistant_tools.TASK_NAMES | {media_output.TOOL_NAME}))
+                             if ((f.get('function') or {}).get('name') not in assistant_tools.RESERVED | assistant_tools.TASK_NAMES | {media_output.TOOL_NAME, stickers.TOOL_NAME, stickers.SEARCH_TOOL_NAME}))
         if stale():return
         try:
             context=chat_history.memory_context_for(conn)

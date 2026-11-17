@@ -289,6 +289,8 @@
 <link rel="stylesheet" href="/admin/assets/radix-colors.css">
 <link rel="stylesheet" href="/admin/assets/admin-theme.css">
 <script src="/admin/assets/extensions-page.js"></script>
+<script src="/admin/assets/stickers-page.js"></script>
+<link rel="stylesheet" href="/admin/assets/stickers-page.css">
 <script src="/admin/assets/memory-page.js"></script>
 <script src="/admin/assets/task-page.js"></script>
 </head>
@@ -324,6 +326,7 @@
       <button data-page="llm"><span class="ico">✦</span>大模型</button>
       <button data-page="skills"><span class="ico"></span>Skill</button>
       <button data-page="mcp"><span class="ico"></span>MCP</button>
+      <button data-page="stickers"><span class="ico"></span>表情包</button>
       <button data-page="calls"><span class="ico">☎</span>呼名</button>
       <button data-page="memory"><span class="ico">✎</span>记忆</button>
       <button data-page="tasks"><span class="ico">◷</span>任务</button>
@@ -440,7 +443,7 @@ $("auth-form").addEventListener("submit", async (ev) => {
 });
 $("logout").onclick = async () => { if (!confirmLeave()) return; page.dirty = null; await api("logout", {}); await route(); };
 
-const PAGES = { status: renderStatus, how: renderHow, llm: renderLLM, skills: root=>renderExtensions(root,'skills'), mcp: root=>renderExtensions(root,'mcp_servers'), calls: renderCallNames, memory: renderMemory, tasks: renderTasks, asr: renderASR, tts: renderTTS, intent: renderIntent };
+const PAGES = { status: renderStatus, how: renderHow, llm: renderLLM, skills: root=>renderExtensions(root,'skills'), mcp: root=>renderExtensions(root,'mcp_servers'), stickers: renderStickers, calls: renderCallNames, memory: renderMemory, tasks: renderTasks, asr: renderASR, tts: renderTTS, intent: renderIntent };
 const page = { name: "", dirty: null, timer: null };
 function currentPage() { const p = location.hash.slice(1); return PAGES[p] ? p : "status"; }
 function confirmLeave() { return !(page.dirty && page.dirty()) || confirm("当前页面有修改还没保存，确定离开吗？"); }

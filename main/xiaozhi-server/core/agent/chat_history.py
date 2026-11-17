@@ -1086,7 +1086,7 @@ def _display_text(content) -> str:
 def history(device: str, limit: int, models: List[str] = None) -> Dict[str, list]:
     """给屏幕显示的记录：{模型: [{id, role, text, time, interrupted}]}，只有用户的话和助手的回复。"""
     from core.utils.textUtils import check_emoji
-    from core.agent import media_output
+    from core.agent import media_output, stickers
 
     store = db()
     out = {}
@@ -1096,7 +1096,7 @@ def history(device: str, limit: int, models: List[str] = None) -> Dict[str, list
         # 多取一些：工具消息不显示
         for r in store.recent(device, name, limit * 3):
             for call in r.get("tool_calls") or []:
-                if (call.get("function") or {}).get("name") == media_output.TOOL_NAME:
+                if (call.get("function") or {}).get("name") in (media_output.TOOL_NAME, stickers.TOOL_NAME):
                     media_calls.add(call.get("id"))
             if r["role"] == "tool" and r.get("tool_call_id") in media_calls:
                 media = media_output.from_tool_result(r["content"])
