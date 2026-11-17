@@ -1,6 +1,7 @@
 """统一工具处理器"""
 
 import json
+import threading
 from typing import Dict, List, Any, Optional
 from config.logger import setup_logging
 from plugins_func.loadplugins import auto_import_modules
@@ -53,6 +54,7 @@ class UnifiedToolHandler:
 
         # 初始化标志
         self.finish_init = False
+        self.ready = threading.Event()
 
     async def _initialize(self):
         """异步初始化"""
@@ -77,6 +79,8 @@ class UnifiedToolHandler:
 
         except Exception as e:
             self.logger.error(f"统一工具处理器初始化失败: {e}")
+        finally:
+            self.ready.set()
 
     async def _initialize_mcp_endpoint(self):
         """初始化MCP接入点"""

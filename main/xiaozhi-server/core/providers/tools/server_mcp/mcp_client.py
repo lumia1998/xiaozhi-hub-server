@@ -38,6 +38,7 @@ class ServerMCPClient:
         self._worker_task: Optional[asyncio.Task] = None
         self._ready_evt = asyncio.Event()
         self._shutdown_evt = asyncio.Event()
+        self._error = None
 
         self.session: Optional[ClientSession] = None
         self.tools: List = []  # 原始工具对象
@@ -64,7 +65,14 @@ class ServerMCPClient:
                         message_handler=message_handler,
                         client_info=client_info), name="ServerMCPClientWorker"
         )
-        await self._ready_evt.wait()
+        ready = asyncio.create_task(self._ready_evt.wait())
+        try:
+            await asyncio.wait((ready, self._worker_task), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            ready.cancel()
+            await asyncio.gather(ready, return_exceptions=True)
+        if self._error is not None or not self.session or self._worker_task.done():
+            raise RuntimeError("MCP 连接未建立") from None
 
         self.logger.bind(tag=TAG).info(
             f"服务端MCP客户端已连接，可用工具: {[name for name in self.name_mapping.values()]}"
@@ -79,9 +87,10 @@ class ServerMCPClient:
         try:
             await asyncio.wait_for(self._worker_task, timeout=20)
         except (asyncio.TimeoutError, Exception) as e:
-            self.logger.bind(tag=TAG).error(f"服务端MCP客户端关闭错误: {e}")
+            self.logger.bind(tag=TAG).warning(f"MCP 客户端已结束: {type(e).__name__}")
         finally:
             self._worker_task = None
+            self.session = None
 
     def has_tool(self, name: str) -> bool:
         """检查是否包含指定工具
@@ -244,9 +253,25 @@ class ServerMCPClient:
                 await self.session.initialize()
 
                 # 获取工具
-                self.tools = (await self.session.list_tools()).tools
+                self.tools = []
+                cursor = None
+                seen = set()
+                for _ in range(100):
+                    result = await self.session.list_tools(cursor=cursor)
+                    self.tools.extend(result.tools)
+                    cursor = result.nextCursor
+                    if not cursor:
+                        break
+                    if cursor in seen:
+                        raise ValueError("MCP 工具分页游标重复")
+                    seen.add(cursor)
+                else:
+                    raise ValueError("MCP 工具分页过多")
                 for t in self.tools:
                     sanitized = sanitize_tool_name(t.name)
+                    if sanitized in self.tools_dict:
+                        import hashlib
+                        sanitized = sanitized[:40] + '_' + hashlib.sha256(t.name.encode()).hexdigest()[:12]
                     self.tools_dict[sanitized] = t
                     self.name_mapping[sanitized] = t.name
 
@@ -256,6 +281,6 @@ class ServerMCPClient:
                 await self._shutdown_evt.wait()
 
             except Exception as e:
-                self.logger.bind(tag=TAG).error(f"服务端MCP客户端工作协程错误: {e}")
+                self._error = e
+                self.logger.bind(tag=TAG).error(f"MCP 连接失败: {type(e).__name__}")
                 self._ready_evt.set()
-                raise

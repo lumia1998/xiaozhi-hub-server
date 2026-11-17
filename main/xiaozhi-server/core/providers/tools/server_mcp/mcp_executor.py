@@ -32,10 +32,7 @@ class ServerMCPExecutor(ToolExecutor):
             )
 
         try:
-            # 移除mcp_前缀（如果有）
             actual_tool_name = tool_name
-            if tool_name.startswith("mcp_"):
-                actual_tool_name = tool_name[4:]
 
             result = await self.mcp_manager.execute_tool(actual_tool_name, arguments)
 
@@ -76,10 +73,7 @@ class ServerMCPExecutor(ToolExecutor):
         if not self._initialized or not self.mcp_manager:
             return False
 
-        # 移除mcp_前缀（如果有）
         actual_tool_name = tool_name
-        if tool_name.startswith("mcp_"):
-            actual_tool_name = tool_name[4:]
 
         return self.mcp_manager.is_mcp_tool(actual_tool_name)
 

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from pathlib import Path
 
 import websockets
 from config.logger import setup_logging
@@ -33,9 +34,11 @@ _setup_websockets_logger()
 from core.connection import ConnectionHandler
 from config.config_loader import get_config_from_api_async
 from core.auth import AuthManager, AuthenticationError
-from core.utils import tts_phrase_cache
+from core.device_pairing import PairingStore
+from config.config_loader import get_project_dir
 from core.utils.modules_initialize import initialize_modules
 from core.utils.util import check_vad_update, check_asr_update
+from core.agent.task_worker import TaskWorker
 
 TAG = __name__
 
@@ -60,31 +63,68 @@ class WebSocketServer:
         self._llm = modules["llm"] if "llm" in modules else None
         self._intent = modules["intent"] if "intent" in modules else None
         self._memory = modules["memory"] if "memory" in modules else None
-        # [xiaozhi-hub] 提示语（"交给 Grok Bot 了"等）先在后台合成好，用到时不用现合成
-        if "TTS" in self.config["selected_module"]:
-            tts_phrase_cache.prewarm(self.config)
 
-        auth_config = self.config["server"].get("auth", {})
-        self.auth_enable = auth_config.get("enabled", False)
-        # 设备白名单
+        self.pairing_path = Path(get_project_dir()) / "data" / "device_auth.db"
+        self._refresh_auth_settings(self.config)
+        self.task_worker = TaskWorker(self.config)
+        self.task_worker.owner_resolver = self.owner_for_device
+
+    def _refresh_auth_settings(self, config):
+        auth_config = (config.get("server") or {}).get("auth") or {}
+        self.auth_enable = bool(auth_config.get("enabled", False))
+        self.device_auth_enable = bool((auth_config.get("device_auth") or {}).get("enabled", False))
         self.allowed_devices = set(auth_config.get("allowed_devices", []))
-        secret_key = self.config["server"]["auth_key"]
-        expire_seconds = auth_config.get("expire_seconds", None)
+        secret_key = str((config.get("server") or {}).get("auth_key") or "")
+        expire_seconds = auth_config.get("expire_seconds")
         self.auth = AuthManager(secret_key=secret_key, expire_seconds=expire_seconds)
+        # Keep the pairing store available to the admin UI while enforcement is
+        # disabled, so credentials can be provisioned before the explicit switch.
+        if not secret_key:
+            if getattr(self, "pairing", None) is not None:
+                self.pairing.close()
+            self.pairing = None
+            self._pairing_secret = ""
+        elif getattr(self, "pairing", None) is None or getattr(self, "_pairing_secret", None) != secret_key:
+            if getattr(self, "pairing", None) is not None:
+                self.pairing.close()
+            self.pairing = PairingStore(self.pairing_path, secret_key)
+            self._pairing_secret = secret_key
+        worker = getattr(self, "task_worker", None)
+        if worker is not None:
+            worker.owner_resolver = self.owner_for_device
+
+    def owner_for_device(self, device_id):
+        """Resolve the authenticated principal when pairing is enforced."""
+        if self.device_auth_enable and self.pairing is not None:
+            owner = self.pairing.owner_for_device(device_id)
+            if owner:
+                return owner
+        from core.agent import chat_history
+        return chat_history.owner_for_device(device_id)
 
     async def start(self):
         server_config = self.config["server"]
         host = server_config.get("ip", "0.0.0.0")
         port = int(server_config.get("port", 8000))
 
-        async with websockets.serve(
-            self._handle_connection,
-            host,
-            port,
-            process_request=self._http_response,
-            ping_interval=None,
-        ):
-            await asyncio.Future()
+        from core.agent.chat_history import retention_loop
+        retention = asyncio.create_task(retention_loop(self.config), name='memory-retention')
+        self.task_worker.start()
+        try:
+            async with websockets.serve(
+                self._handle_connection,
+                host,
+                port,
+                process_request=self._http_response,
+                ping_interval=None,
+            ):
+                await asyncio.Future()
+        finally:
+            self.task_worker.stop()
+            if getattr(self, "pairing", None) is not None:
+                self.pairing.close()
+            retention.cancel()
+            await asyncio.gather(retention, return_exceptions=True)
 
     async def _handle_connection(self, websocket: websockets.ServerConnection):
         headers = dict(websocket.request.headers)
@@ -116,7 +156,7 @@ class WebSocketServer:
         """处理新连接，每次创建独立的ConnectionHandler"""
         # 先认证，后建立连接
         try:
-            await self._handle_auth(websocket)
+            authenticated_owner = await self._handle_auth(websocket)
         except AuthenticationError:
             await websocket.send("认证失败")
             await websocket.close()
@@ -131,6 +171,7 @@ class WebSocketServer:
             self._intent,
             self,  # 传入server实例
         )
+        handler.authenticated_owner_id = authenticated_owner
         try:
             await handler.handle_connection(websocket)
         except Exception as e:
@@ -182,6 +223,11 @@ class WebSocketServer:
                 )
                 # 更新配置
                 self.config = new_config
+                self._refresh_auth_settings(new_config)
+                http_server = getattr(self, "http_server", None)
+                if http_server is not None and hasattr(http_server, "update_config"):
+                    http_server.update_config(new_config)
+                self.task_worker.update_config(new_config)
                 # 重新初始化组件
                 modules = initialize_modules(
                     self.logger,
@@ -213,23 +259,27 @@ class WebSocketServer:
 
     async def _handle_auth(self, websocket: websockets.ServerConnection):
         # 先认证，后建立连接
-        if self.auth_enable:
-            headers = dict(websocket.request.headers)
-            device_id = headers.get("device-id", None)
-            client_id = headers.get("client-id", None)
-            if self.allowed_devices and device_id in self.allowed_devices:
-                # 如果属于白名单内的设备，不校验token，直接放行
-                return
+        headers = dict(websocket.request.headers)
+        device_id = headers.get("device-id", None)
+        client_id = headers.get("client-id", None)
+        if self.device_auth_enable:
+            pairing_token = headers.get("x-device-pairing-token", "")
+            if not self.pairing or not self.pairing.verify(device_id or "", pairing_token):
+                raise AuthenticationError("Device pairing required")
+            owner = self.pairing.owner_for_device(device_id or "")
+            if not owner:
+                raise AuthenticationError("Device pairing owner unavailable")
+            return owner
+        if not self.auth_enable:
+            return None
+        # Pairing is an additional device credential. A legacy allowed-device
+        # entry can skip the HMAC token, but never skips pairing verification.
+        if not (self.allowed_devices and device_id in self.allowed_devices):
+            token = headers.get("authorization", "")
+            if token.startswith("Bearer "):
+                token = token[7:]
             else:
-                # 否则校验token
-                token = headers.get("authorization", "")
-                if token.startswith("Bearer "):
-                    token = token[7:]  # 移除'Bearer '前缀
-                else:
-                    raise AuthenticationError("Missing or invalid Authorization header")
-                # 进行认证
-                auth_success = self.auth.verify_token(
-                    token, client_id=client_id, username=device_id
-                )
-                if not auth_success:
-                    raise AuthenticationError("Invalid token")
+                raise AuthenticationError("Missing or invalid Authorization header")
+            if not self.auth.verify_token(token, client_id=client_id, username=device_id):
+                raise AuthenticationError("Invalid token")
+        return None

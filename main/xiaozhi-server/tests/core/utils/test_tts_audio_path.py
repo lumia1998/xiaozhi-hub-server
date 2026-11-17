@@ -75,18 +75,9 @@ def test_short_phrases_are_synthesized_once(monkeypatch):
     tts.calls, tts.audio_file_type = [], "mp3"
     monkeypatch.setattr("core.providers.tts.base.decode_audio_bytes", lambda data, ft, sr: b"\x01\x00" * 10)
     monkeypatch.setattr(tts_phrase_cache, "_cache", type(tts_phrase_cache._cache)())
-    assert tts._synthesize_pcm("交给 Grok Bot 了", 16000) == b"\x01\x00" * 10
-    assert tts._synthesize_pcm("交给 Grok Bot 了", 16000) == b"\x01\x00" * 10
+    assert tts._synthesize_pcm("我在", 16000) == b"\x01\x00" * 10
+    assert tts._synthesize_pcm("我在", 16000) == b"\x01\x00" * 10
     long = "这是一段很长的正式回复，每次内容都不一样，不应该进缓存"
     tts._synthesize_pcm(long, 16000)
     tts._synthesize_pcm(long, 16000)
-    assert tts.calls == ["交给 Grok Bot 了", long, long]
-
-
-def test_prompt_phrases_from_config():
-    cfg = {"LLM": {
-        "GrokBot_a": {"type": "grok_bot", "bot_id": "x"},
-        "ClaudeCLI": {"type": "claude_cli", "first_reply_filler": "稍等，我想想", "progress_reply": "还在弄"},
-        "DeepSeekLLM": {"type": "openai"},
-    }}
-    assert tts_phrase_cache.prompt_phrases(cfg) == ["交给 Grok Bot 了", "还在处理 请稍等", "稍等 我想想", "还在弄"]
+    assert tts.calls == ["我在", long, long]

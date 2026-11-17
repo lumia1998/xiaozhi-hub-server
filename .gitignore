@@ -200,3 +200,20 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01.tar.bz2
 
 # [xiaozhi-hub] 运行时生成的唤醒词回复音频缓存（core/utils/wakeup_word.py）
 main/xiaozhi-server/config/assets/wakeup_words/
+
+node_modules/
+node_modules.*/
+.venv-*/
+/python/
+/.deployed.json
+.env.*.local
+.env.*
+!.env.example
+!.env.*.example
+.secrets.*
+.config.yaml.*
+*.key
+*.pem
+*.db
+*.db-shm
+*.db-wal

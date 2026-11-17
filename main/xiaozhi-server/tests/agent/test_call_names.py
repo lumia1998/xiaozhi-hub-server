@@ -8,11 +8,14 @@ from core.admin import catalog  # noqa: F401  提前导入：在事件循环里�
 from core.agent import call_names, llm_router
 from core.agent.call_names import handle_call_name, match_call_name
 
+# 真人录音里语音识别把 Claude 听成 cloud、克劳德等，用户就照这些给 Claude 配称呼
+MODELS = {"ClaudeAPI": ["claude", "cloud", "clod", "clot", "克劳德"]}
+
 
 @pytest.mark.parametrize("asr_text", ["Hi, cloud.", "Hi, cloud. Hi, cloud.", "High cloud.", "嗨 Claude", "hey，克劳德！",
                                       "He cloud.", "Heい cloud。", "Hei cloud", "H, cloud."])  # "嘿"被识别成 he、h（真机实测）
 def test_only_call_name(asr_text):
-    assert match_call_name(asr_text) == ("ClaudeCLI", "")
+    assert match_call_name(asr_text, MODELS) == ("ClaudeAPI", "")
 
 
 @pytest.mark.parametrize("asr_text, rest", [
@@ -24,7 +27,7 @@ def test_only_call_name(asr_text):
     ("Hi Claude, 用 Python 写个脚本", "用 Python 写个脚本"),
 ])
 def test_call_name_with_content(asr_text, rest):
-    assert match_call_name(asr_text) == ("ClaudeCLI", rest)
+    assert match_call_name(asr_text, MODELS) == ("ClaudeAPI", rest)
 
 
 @pytest.mark.parametrize("asr_text", [
@@ -44,13 +47,14 @@ def test_call_name_with_content(asr_text, rest):
     "",
 ])
 def test_not_call_name(asr_text):
-    assert match_call_name(asr_text) is None
+    assert match_call_name(asr_text, MODELS) is None
 
 
 def test_custom_models():
     models = {"GrokLLM": ["格罗克"]}
     assert match_call_name("嗨 格罗克，你怎么看", models) == ("GrokLLM", "你怎么看")
     assert match_call_name("嗨 cloud", models) is None
+    assert match_call_name("嗨 cloud") is None  # 没配称呼时什么都不认
 
 
 def test_alias_written_as_string():
@@ -74,7 +78,7 @@ def reply_cache(tmp_path, monkeypatch):
 def make_conn(cfg=None):
     logger = SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None)
     return SimpleNamespace(
-        config={"call_names": cfg} if cfg is not None else {},
+        config={"call_names": {"models": MODELS, **(cfg or {})}},
         logger=SimpleNamespace(bind=lambda **k: logger),
         dialogue=SimpleNamespace(put=conn_messages.append),
         client_abort=True, sentence_id=None, tts=object(),
@@ -109,14 +113,14 @@ async def test_handle_passes_through_without_call_name(spoken):
 
 async def test_handle_strips_call_name_and_switches(spoken):
     assert await handle_call_name(make_conn(), "嗨cloud接着上次聊。") == "接着上次聊。"
-    assert spoken["tts"] == [] and spoken["switch"] == ["ClaudeCLI"]
+    assert spoken["tts"] == [] and spoken["switch"] == ["ClaudeAPI"]
 
 
 async def test_handle_routes_by_configured_models(spoken):
-    cfg = {"models": {"claude": ["cloud"], "DeepSeekLLM": ["深度求索"]}}  # 第一期的 "claude" 键也认
+    cfg = {"models": {"ClaudeAPI": ["cloud"], "DeepSeekLLM": ["深度求索"]}}
     assert await handle_call_name(make_conn(cfg), "嗨 深度求索，你好") == "你好"
     assert await handle_call_name(make_conn(cfg), "嗨 cloud") is None
-    assert spoken["switch"] == ["DeepSeekLLM", "ClaudeCLI"]
+    assert spoken["switch"] == ["DeepSeekLLM", "ClaudeAPI"]
 
 
 async def test_handle_unready_model_tells_user(spoken):
@@ -130,7 +134,7 @@ async def test_handle_only_call_name_replies_without_model(spoken):
     c = make_conn()
     assert await handle_call_name(c, "Hi, cloud.") is None
     assert spoken["stt"] == ["Hi, cloud."] and spoken["tts"] == [call_names.DEFAULT_REPLY]
-    assert spoken["switch"] == ["ClaudeCLI"]  # 只说称呼也会切换并记住
+    assert spoken["switch"] == ["ClaudeAPI"]  # 只说称呼也会切换并记住
     assert c.client_abort is False and c.sentence_id
     assert [m.role for m in conn_messages] == ["user"]
 
@@ -164,8 +168,8 @@ def test_extract_alias(asr_text, alias):
 def test_learner_counts_and_targets_device():
     lr = call_names.Learner()
     assert lr.capture("s1", "嗨 cloud") is None  # 没开始录入
-    lr.start("s1", count=2, target="ClaudeCLI")
-    assert lr.status()["target"] == "ClaudeCLI"
+    lr.start("s1", count=2, target="ClaudeAPI")
+    assert lr.status()["target"] == "ClaudeAPI"
     assert lr.capture("s2", "嗨 cloud") is None  # 不是目标设备
     assert lr.capture("s1", "嗨 cloud") == (1, 2)
     assert lr.capture("s1", "嗨 克劳德") == (2, 2)
@@ -286,38 +290,15 @@ async def test_reply_audio_warmed_up_and_kept_on_disk(spoken, monkeypatch, reply
     assert len(synthesized) == 2 and spoken["tts"] == [] and sent[-2][0] == "FIRST"
 
 
-async def test_warm_up_skipped_when_call_names_disabled(monkeypatch):
+async def test_warm_up_skipped_only_when_call_names_and_wake_greeting_are_off():
+    """唤醒词的问候也播这句回复：关了呼名、唤醒问候还开着时照样预合成。"""
+    synthesized = []
     c = make_conn({"enabled": False})
-    c.tts = SimpleNamespace(voice="v1", to_tts=lambda text: pytest.fail("不该合成"))
+    c.tts = SimpleNamespace(voice="v1", to_tts=lambda text: synthesized.append(text) or [b"\x01"])
+    c.sample_rate = 24000
+    c.config["enable_greeting"] = False
     await call_names.warm_up(c)
-
-
-async def test_only_call_name_speaks_pending_report_of_grok_bot(spoken):
-    from core.agent import reports
-
-    reports.clear()
-    c = make_conn({"models": {"GrokBot_孙悟空": ["孙悟空"]}})
-    c.config["LLM"] = {"GrokBot_孙悟空": {"type": "grok_bot", "bot_id": "bot-1", "bot_name": "孙悟空"}}
-    c.session_id, c.device_id = "s-1", "dev-1"
-    reports.add("dev-1", "bot-1", "孙悟空做完了：好。")
-    assert await handle_call_name(c, "嗨 孙悟空") is None
-    assert spoken["tts"] == [call_names.DEFAULT_REPLY + "。孙悟空做完了：好。"]
-    assert not reports.pending("dev-1")
-    assert await handle_call_name(c, "嗨 孙悟空") is None
-    assert spoken["tts"][-1] == call_names.DEFAULT_REPLY  # 念过就没有了
-
-
-async def test_pending_report_put_back_when_tts_not_ready(spoken, monkeypatch):
-    from core.agent import reports
-
-    reports.clear()
-    c = make_conn({"models": {"GrokBot_孙悟空": ["孙悟空"]}})
-    c.config["LLM"] = {"GrokBot_孙悟空": {"type": "grok_bot", "bot_id": "bot-1", "bot_name": "孙悟空"}}
-    c.session_id, c.device_id = "s-1", "dev-1"
-    c.tts = None  # TTS 还没就绪，念不了
-    clock = iter(range(100))
-    monkeypatch.setattr(call_names.time, "monotonic", lambda: next(clock))
-    reports.add("dev-1", "bot-1", "孙悟空做完了：好。")
-    assert await handle_call_name(c, "嗨 孙悟空") == "嗨 孙悟空"
-    assert spoken["tts"] == [] and reports.pending("dev-1", "bot-1")  # 没念成，放回去了
-    reports.clear()
+    assert synthesized == []
+    c.config["enable_greeting"] = True
+    await call_names.warm_up(c)
+    assert synthesized == [call_names.reply_text(c.config["call_names"])]

@@ -1,8 +1,7 @@
 """ManageApiClient 生命周期回归测试：直接以 unittest 运行，不依赖应用/模型与网络。
 
-不进 pytest 套件：tests/conftest.py 的 mock 层（import 时全局替换
-asyncio.sleep 与 httpx.AsyncClient）与本文件的时序断言、MockTransport
-注入互相破坏；__test__ = False 使 pytest 跳过收集，请直接用 unittest 运行。
+不进 pytest 套件：tests/conftest.py 的 mock 层在 import 时把 asyncio.sleep 换成立即返回，
+和本文件的时序断言互相破坏；__test__ = False 使 pytest 跳过收集，请直接用 unittest 运行。
 Usage: python -B tests/test_manage_api_client_lifecycle.py -v
 """
 __test__ = False

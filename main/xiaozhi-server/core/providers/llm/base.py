@@ -20,15 +20,3 @@ class LLMProviderBase(ABC):
         for part in self.response("", dialogue, **kwargs):
             result += part
         return result
-    
-    def response_with_functions(self, session_id, dialogue, functions=None):
-        """
-        Default implementation for function calling (streaming)
-        This should be overridden by providers that support function calls
-
-        Returns: generator that yields either text tokens or a special function call token
-        """
-        # For providers that don't support functions, just return regular response
-        for token in self.response(session_id, dialogue):
-            yield token, None
-

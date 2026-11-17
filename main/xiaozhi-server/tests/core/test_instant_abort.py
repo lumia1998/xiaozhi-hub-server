@@ -4,7 +4,6 @@ import json
 import queue
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -19,6 +18,7 @@ from core.providers.asr.base import ASRProviderBase
 from core.providers.tts.dto.dto import SentenceType
 from core.utils import turn_gen
 from core.utils.dialogue import Dialogue
+from tests.fake_pi import FakePi
 
 
 def make_conn(llm=None):
@@ -32,7 +32,6 @@ def make_conn(llm=None):
     h.config = {}
     h.current_speaker = None
     h.introduced_speakers = set()
-    h.system_introduced_speakers = set()
     h.features = {"emoji": False}
     h.client_abort = False
     h.client_is_speaking = False
@@ -50,6 +49,7 @@ def make_conn(llm=None):
     h.executor = MagicMock()
     h.voiceprint_provider = None
     h.read_config_from_api = False
+    h.stop_event = threading.Event()
     return h
 
 
@@ -195,25 +195,24 @@ async def test_start_to_chat_hands_its_turn_to_chat(monkeypatch):
 # ---------- 思考中打断 ----------
 
 def test_chat_queued_before_an_abort_never_asks_the_model():
-    llm = MagicMock()
+    llm = FakePi()
     h = make_conn(llm)
     gen = turn_gen.bump(h)
     turn_gen.bump(h)                  # 线程还没接手就被打断了
     assert h.chat("旧的问题", turn=gen) is None
-    llm.response.assert_not_called()
+    assert llm.asked == []
     assert contents(h) == []
 
 
-class ThinkingLLM:
-    """第一个问题要想很久（release 之前不出字）；记下每次收到的对话。"""
+class ThinkingLLM(FakePi):
+    """第一个问题要想很久（release 之前不出字）；asked 记下每次收到的对话。"""
 
     def __init__(self):
-        self.asked = []
+        super().__init__()
         self.thinking = threading.Event()
         self.release = threading.Event()
 
-    def response(self, session_id, dialogue, **kw):
-        self.asked.append([(m["role"], m.get("content")) for m in dialogue])
+    def answer(self, dialogue):
         if dialogue[-1]["content"] == "第一个问题":
             self.thinking.set()
             self.release.wait(5)
@@ -236,11 +235,11 @@ async def test_abort_while_thinking_leaves_a_clean_context():
     # 用户接着问了新问题（startToChat 把 client_abort 清回 False），这时旧的模型才想完
     h.client_abort = False
     new = turn_gen.bump(h)
-    await asyncio.to_thread(h.chat, "第二个问题", 0, new)
+    await asyncio.to_thread(h.chat, "第二个问题", turn=new)
     llm.release.set()
     await asyncio.to_thread(t.join, 5)
 
-    assert [m for m in llm.asked[1] if m[0] != "system"] == [("user", "第二个问题")]
+    assert [(m["role"], m["content"]) for m in llm.asked[1] if m["role"] != "system"] == [("user", "第二个问题")]
     assert contents(h) == [("user", "第二个问题"), ("assistant", "新的回答。")]
     assert "旧的回答，不该播。" not in tts_texts(h)
 
@@ -248,15 +247,14 @@ async def test_abort_while_thinking_leaves_a_clean_context():
 async def test_tool_call_cut_off_by_an_abort_is_not_run():
     yielded, go_on = threading.Event(), threading.Event()
 
-    def call(name, args):
-        return SimpleNamespace(index=0, id="c1", function=SimpleNamespace(name=name, arguments=args))
+    class ToolLLM(FakePi):
+        """模型还在生成工具调用时设备打断了；Pi 生成完照样来要执行工具。"""
 
-    class ToolLLM:
-        def response_with_functions(self, session_id, dialogue, functions=None, **kw):
-            yield None, [call("set_volume", '{"vol')]
+        def events(self, session_id, dialogue, tools=None, tool=None, stale=lambda: False):
             yielded.set()
             go_on.wait(5)
-            yield None, [call(None, 'ume": 100}')]
+            tool({"type": "tool_request", "name": "set_volume", "arguments": {"volume": 100}, "call_id": "c1"})
+            yield {"type": "turn_end"}
 
     h = make_conn(ToolLLM())
     h.intent_type = "function_call"
@@ -285,65 +283,6 @@ async def test_late_audio_of_the_aborted_turn_is_not_sent():
     await sendAudioMessage(h, SentenceType.MIDDLE, [b"opus"], None, old)
     await sendAudioMessage(h, SentenceType.FIRST, None, "旧的一句", old)
     h.websocket.send.assert_not_awaited()
-
-
-# ---------- 普通 API 模型：打断时立即断开流式请求 ----------
-
-class _StallingSSE(BaseHTTPRequestHandler):
-    """出一个字后就不再出字（模型在想），连接一直挂着。"""
-
-    def do_POST(self):
-        self.rfile.read(int(self.headers.get("Content-Length", 0)))
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.end_headers()
-        chunk = {"id": "1", "object": "chat.completion.chunk", "created": 0, "model": "m",
-                 "choices": [{"index": 0, "delta": {"content": "好"}, "finish_reason": None}]}
-        self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
-        self.wfile.flush()
-        time.sleep(10)
-
-    def log_message(self, *a):
-        pass
-
-
-def test_openai_abort_cuts_a_stalled_stream_at_once(monkeypatch):
-    from core.providers.llm.openai.openai import LLMProvider
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _StallingSSE)
-    server.daemon_threads = True
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
-        base_url = f"http://127.0.0.1:{server.server_port}/v1"
-        llm = LLMProvider({"model_name": "m", "api_key": "sk-test", "base_url": base_url})
-        # conftest 把 httpx.Client 换成了不联网的桩；这里只连本机的假服务，用真的
-        import httpx
-        import httpx._client
-        import openai
-        monkeypatch.setattr(httpx, "Client", httpx._client.Client)
-        llm.client = openai.OpenAI(api_key="sk-test", base_url=base_url, http_client=httpx.Client())
-        got, ended = [], threading.Event()
-
-        def read():
-            try:
-                for piece in llm.response("s", [{"role": "user", "content": "hi"}]):
-                    got.append(piece)
-            except Exception as e:
-                got.append(type(e).__name__)
-            ended.set()
-
-        threading.Thread(target=read, daemon=True).start()
-        wait_for(lambda: got)
-        assert not ended.wait(0.3)                  # 卡在等下一块
-        t0 = time.monotonic()
-        llm.abort(SimpleNamespace(session_id="s"))
-        assert ended.wait(2)
-        assert time.monotonic() - t0 < 1
-        assert got[0] == "好" and not llm._streams
-        # 别的连接的流不受影响
-        llm.abort(SimpleNamespace(session_id="other"))
-    finally:
-        server.shutdown()
 
 
 # ---------- 聊天记录落盘：被打断丢掉的这一轮不存库 ----------
@@ -375,7 +314,7 @@ async def test_question_interrupted_while_thinking_is_never_stored():
     llm.release.set()
     await asyncio.to_thread(t.join, 5)          # 旧的 chat() 结束时也会同步一次库
     h.client_abort = False
-    await asyncio.to_thread(h.chat, "第二个问题", 0, turn_gen.bump(h))
+    await asyncio.to_thread(h.chat, "第二个问题", turn=turn_gen.bump(h))
     assert stored() == [("user", "第二个问题"), ("assistant", "新的回答。")]
 
 
@@ -397,23 +336,3 @@ def test_turn_already_stored_then_dropped_is_deleted_from_the_db():
     assert len(stored()) == 2
     reply_progress.cut(conn, played_ms=0)
     assert stored() == []
-
-
-async def test_agent_interrupted_while_thinking_keeps_question_and_stays_silent():
-    """Claude Code / Grok Bot：被打断后它们自己转后台（做完进待汇报，不经过这里）；
-    这里只保证旧一轮迟到的字不送合成，记录里提问留着、回复记"……"。"""
-    llm = ThinkingLLM()
-    llm.AGENT_LABEL = "Claude Code"
-    h = make_conn(llm)
-    gen = turn_gen.bump(h)
-    t = threading.Thread(target=h.chat, args=("第一个问题",), kwargs={"turn": gen})
-    t.start()
-    await asyncio.to_thread(llm.thinking.wait, 5)
-    h.client_is_speaking = True
-    await handleAbortMessage(h, played_ms=0, drop_audio=True)
-    h.client_abort = False                       # 新的一轮开始了
-    await asyncio.to_thread(h.chat, "第二个问题", 0, turn_gen.bump(h))
-    llm.release.set()
-    await asyncio.to_thread(t.join, 5)
-    assert "旧的回答，不该播。" not in tts_texts(h)
-    assert contents(h) == [("user", "第一个问题"), ("assistant", "……"), ("user", "第二个问题"), ("assistant", "新的回答。")]

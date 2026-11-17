@@ -1,11 +1,12 @@
 """[xiaozhi-hub] 模型漏进回复文字的工具调用标记（DeepSeek DSML 等）不念、不上屏、不写进对话。"""
-import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from core.connection import ConnectionHandler
 from core.utils.dialogue import Dialogue
 from core.utils.tool_markup import ToolMarkupFilter, strip_tool_markup
+from tests.fake_pi import FakePi
 
 # 2026-11-01 00:47 设备上 DeepSeek 讲完故事后实际念出来的那段
 LEAK = "</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>"
@@ -67,7 +68,7 @@ def test_normal_text_is_untouched():
             assert stream(text, size) == text, (text, size)
 
 
-# ---------- ConnectionHandler.chat()：两条路径都要过滤 ----------
+# ---------- ConnectionHandler.chat()：念的和写进对话的都要过滤 ----------
 
 def make_handler(llm, intent_type):
     h = ConnectionHandler.__new__(ConnectionHandler)
@@ -80,11 +81,11 @@ def make_handler(llm, intent_type):
     h.func_handler = SimpleNamespace(get_functions=lambda: [])
     h.config = {}
     h.current_speaker = None
-    h.system_introduced_speakers = set()
     h.features = {"emoji": False}
     h.client_abort = False
     h.sentence_id = None
     h.session_id = "s"
+    h.stop_event = threading.Event()
     return h
 
 
@@ -101,34 +102,12 @@ def chunks(text, size=3):
     return [text[i:i + size] for i in range(0, len(text), size)]
 
 
-def test_direct_answer_path():
-    """DeepSeek 讲故事走 direct_answer 的 response 参数；变形标记接口认不出，留在参数里。"""
-    reply = "从前有只小猫。\n要不要我再讲一个别的呀？\n" + LEAK
-    args = json.dumps({"response": reply}, ensure_ascii=False)
-
-    def call(i, name=None, arguments=None):
-        return SimpleNamespace(index=0, id="c1" if i == 0 else None,
-                               function=SimpleNamespace(name=name, arguments=arguments))
-
-    class FakeLLM:
-        def response_with_functions(self, session_id, dialogue, functions=None, **kw):
-            assert any(f["function"]["name"] == "direct_answer" for f in functions)
-            yield None, [call(0, name="direct_answer")]
-            for i, part in enumerate(chunks(args), 1):
-                yield None, [call(i, arguments=part)]
-
-    h = make_handler(FakeLLM(), "function_call")
-    h.chat("讲个小猫的故事")
-    assert "DSML" not in spoken(h) and "从前有只小猫" in spoken(h)
-    assert stored(h) == ["从前有只小猫。\n要不要我再讲一个别的呀？"]
-
-
 def test_content_path():
-    """不走 direct_answer（例如工具结果之后的那轮）时，标记从正文 content 进来。"""
+    """标记混在回复文字里：边生成边念时滤掉，写进对话的整条回复里也去掉。"""
     reply = "今天杭州晴，二十度。\n" + LEAK
 
-    class FakeLLM:
-        def response(self, session_id, dialogue, **kw):
+    class FakeLLM(FakePi):
+        def answer(self, dialogue):
             yield from chunks(reply)
 
     h = make_handler(FakeLLM(), "nointent")

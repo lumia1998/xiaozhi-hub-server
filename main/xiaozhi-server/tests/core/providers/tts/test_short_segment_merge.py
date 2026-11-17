@@ -48,7 +48,7 @@ def test_short_sentence_joins_the_next(step):
 
 def test_long_enough_segment_is_cut_at_once():
     # 提示语（填充语）不能等后面的文字：够长就马上切出来
-    assert _segments("😶交给 Grok Bot 了。", 1, stop=False) == ["交给 Grok Bot 了"]
+    assert _segments("😶稍等，我查一下。", 1, stop=False) == ["稍等，我查一下"]
     assert _segments("还在处理，请稍等。", 1, first_sentence=False, stop=False) == ["还在处理，请稍等"]
 
 

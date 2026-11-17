@@ -3,12 +3,11 @@
 Uses freezegun to control `datetime.now()` so the tests don't flake
 around midnight, and to verify the weekday/lunar mapping logic.
 """
-from datetime import datetime
-
 import pytest
-from freezegun import freeze_time
 
 from core.utils import current_time
+
+freeze_time = pytest.importorskip("freezegun").freeze_time
 
 
 @freeze_time("2026-09-02 10:30:00")

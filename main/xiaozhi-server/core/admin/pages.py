@@ -1,7 +1,7 @@
 """管理后台各页面的读取与保存逻辑（大模型、语音识别、语音合成、意图识别）。
 
 和 config_store 的通用条目编辑不同，这里按页面组织：只暴露后台要管理的内容，
-并对取值做校验（例如思考力度只能是 low / medium / high），错误信息直接给用户看。
+并对取值做校验（例如说完停顿时长要在 200～5000 毫秒之间），错误信息直接给用户看。
 所有函数只读写配置文件，不碰运行中的服务；热加载由 AdminHandler 负责。
 """
 
@@ -11,14 +11,8 @@ from pathlib import Path
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
 
 from config.config_loader import get_project_dir
-from core.admin import catalog, config_store, plugin_settings
+from core.admin import catalog, config_store, plugin_settings, tts_settings
 from core.agent import asr_text
-
-CLAUDE_CLI_ENTRY = "ClaudeCLI"
-CLAUDE_EFFORT_VALUES = {"", "low", "medium", "high", "xhigh", "max"}
-CLAUDE_PERMISSION_VALUES = {"default", "acceptEdits", "plan", "auto"}
-TOOL_NAME = re.compile(r"^[A-Za-z][\w:.*()\-]*$")
-URL = re.compile(r"^https?://\S+$")
 
 
 def _selected(merged: dict, section: str):
@@ -36,359 +30,20 @@ def _text(value) -> str:
 
 # ---------- 大模型 ----------
 
-def _url_field(entry: dict) -> str:
-    """上游有的条目用 url，有的用 base_url（openai 类型两个都认，base_url 优先）。"""
-    return "url" if "url" in entry and "base_url" not in entry else "base_url"
+def model_choices(merged: dict) -> list:
+    """能切过去的大模型（设备上的模型列表、后台的呼名都用它）：填好了的 API 厂商条目在前，按 LLM_VENDORS 的顺序；
+    type 是 pi、multi_api 的其他条目（模型服务里的模型）在后，vendor 是 custom。"""
+    from core.agent import llm_router
 
-
-def describe_vendor(vendor: dict, merged: dict) -> dict:
-    entry = _entry(merged, "LLM", vendor["entry"])
-    key = entry.get("api_key")
-    base_url = _text(entry.get(_url_field(entry))) or vendor["base_url"]
-    model = _text(entry.get("model_name")) or (vendor["models"][0] if vendor["models"] else "")
-    key_set = not config_store.is_placeholder(key)
-    exists = bool(entry) and entry.get("type") == "openai"
-    return {
-        "id": vendor["id"],
-        "label": vendor["label"],
-        "entry": vendor["entry"],
-        "base_url": base_url,
-        "model": model,
-        "models": vendor["models"],
-        "hint": vendor.get("hint", ""),
-        "key_set": key_set,
-        "key_hint": config_store.mask_key(key),
-        # 自定义服务（本机代理、LM Studio）可能不需要 Key
-        "configured": exists and bool(base_url and model) and (key_set or vendor["id"] == "custom"),
-        "conflict": bool(entry) and entry.get("type") != "openai",
-    }
-
-
-def llm_kind(merged: dict, name: str = None) -> str:
-    name = name or _selected(merged, "LLM")
-    if config_store.entry_type(merged, "LLM", name) == "claude_cli":
-        return "cli"
-    if config_store.entry_type(merged, "LLM", name) == "grok_bot":
-        return "grok"
-    if name in catalog.VENDOR_BY_ENTRY and config_store.entry_type(merged, "LLM", name) == "openai":
-        return "api"
-    return "other"
-
-
-def claude_level(entry: dict) -> str:
-    """从配置反推权限级别；工具组合和三档都对不上时返回 custom（手动改过配置）。"""
-    mode = entry.get("permission_mode") or "default"
-    tools = [str(t) for t in entry.get("allowed_tools") or []]
-    core = sorted(t for t in tools if t not in catalog.CLAUDE_WEB_TOOLS)
-    for level in catalog.CLAUDE_LEVELS:
-        if level["mode"] == mode and core == sorted(level["tools"]):
-            return level["value"]
-    return "custom"
-
-
-def claude_web(entry: dict) -> bool:
-    tools = entry.get("allowed_tools") or []
-    return all(t in tools for t in catalog.CLAUDE_WEB_TOOLS)
-
-
-def describe_claude_cli(merged: dict) -> dict:
-    entry = _entry(merged, "LLM", CLAUDE_CLI_ENTRY)
-    values = {}
-    for name, value in entry.items():
-        if name == "type":
-            continue
-        kind = config_store.field_kind(name, value)
-        if kind in ("text", "number", "bool"):
-            values[name] = "" if kind == "text" and config_store.is_placeholder(value) else value
-        elif kind == "list":
-            values[name] = [str(v) for v in value or []]
-    return {
-        "exists": entry.get("type") == "claude_cli",
-        "values": values,
-        "level": claude_level(entry),
-        "web": claude_web(entry),
-        "options": {
-            "model": catalog.CLAUDE_MODELS,
-            "effort": catalog.CLAUDE_EFFORTS,
-            "level": [{k: lv[k] for k in ("value", "label", "desc")} for lv in catalog.CLAUDE_LEVELS],
-            "tools": catalog.CLAUDE_TOOLS,
-        },
-    }
-
-
-def describe_llm(merged: dict) -> dict:
-    selected = _selected(merged, "LLM")
-    kind = llm_kind(merged, selected)
-    vendor = catalog.VENDOR_BY_ENTRY.get(selected) if kind == "api" else None
-    calls = describe_call_names(merged)
-    return {
-        "selected": selected,
-        "kind": kind,
-        "vendor": vendor["id"] if vendor else None,
-        "claude": describe_claude_cli(merged),
-        "vendors": [describe_vendor(v, merged) for v in catalog.LLM_VENDORS],
-        "grok": {"bots": grok_entries(merged),
-                 "selected": next((g for g in grok_entries(merged) if g["entry"] == selected), None)},
-        # 配了称呼的模型都能叫到，"默认"只是设备刚连上时用的那个；页面据此标出每个模型的称呼
-        "call_names_enabled": calls["enabled"],
-        "callable": {m["entry"]: m["aliases"] for m in calls["models"] if m["aliases"]},
-    }
-
-
-# ---------- 大模型：Grok Bot ----------
-
-GROK_BOT_PREFIX = "GrokBot_"
-GROK_NAME_BAD = re.compile(r"[^\w一-鿿]+")
-
-
-def grok_entries(merged: dict) -> list:
-    """配置里已勾选的 Grok Bot：每个一个 type 为 grok_bot 的 LLM 条目。"""
-    result = []
-    for name, entry in (merged.get("LLM") or {}).items():
-        if isinstance(entry, dict) and entry.get("type") == "grok_bot":
-            result.append({"entry": str(name), "bot_id": str(entry.get("bot_id") or "").strip(),
-                           "bot_name": str(entry.get("bot_name") or "").strip() or str(name)})
-    return result
-
-
-def grok_entry_name(bot_name: str, bot_id: str, taken: dict) -> str:
-    """条目名：GrokBot_<Bot 名>（只留字母、数字、下划线和汉字）；重名时带上 id 的前几位。"""
-    base = GROK_BOT_PREFIX + (GROK_NAME_BAD.sub("", bot_name or "") or bot_id[:8])
-    name = base
-    while name in taken and taken[name] != bot_id:
-        name = f"{base}_{bot_id[:4]}" if name == base else f"{name}_"
-    return name
-
-
-def describe_grok_bot(merged: dict) -> dict:
-    """已勾选的 Bot，以及每个 Bot 在呼名页配的称呼（没配的为空，页面上提示去配）。"""
-    from core.agent import call_names
-
-    aliases = {str(k): call_names._aliases(v) for k, v in ((merged.get("call_names") or {}).get("models") or {}).items()}
-    bots = grok_entries(merged)
-    for b in bots:
-        b["aliases"] = aliases.get(b["entry"], [])
-    return {"entries": bots, "default": _selected(merged, "LLM")}
-
-
-def _default_grok_alias(bot_name: str, taken: set) -> str:
-    """新勾选的 Bot 自动用它的名字做称呼（呼名页可改）；名字不能当称呼（有空格标点、太长、被占用）时不加。"""
-    from core.agent import call_names
-
-    alias = (bot_name or "").strip().lower()
-    if not alias or ALIAS_BAD.search(alias) or not 2 <= len(alias) <= 20 or alias in call_names._PREFIXES or alias in taken:
-        return ""
-    return alias
-
-
-def save_grok_bots(payload: dict, merged: dict, path: Path = None) -> list:
-    """按 payload["bots"]（[{"id", "name"}]）同步条目：新勾选的建条目并自动配上 Bot 名字作称呼，
-    取消的删条目（连同它的称呼）。
-
-    返回修改了的条目名。正在作为默认模型使用的 Bot 不能取消。"""
-    from core.agent import call_names
-
-    raw = payload.get("bots")
-    if not isinstance(raw, list):
-        raise ValueError("Bot 列表格式不对")
-    wanted = {}
-    for item in raw:
-        if not isinstance(item, dict):
-            raise ValueError("Bot 列表格式不对")
-        bot_id = str(item.get("id") or "").strip()
-        if not bot_id:
-            raise ValueError("Bot 缺少 id")
-        wanted[bot_id] = str(item.get("name") or "").strip() or bot_id[:8]
-    current = {g["bot_id"]: g for g in grok_entries(merged)}
-    taken = {g["entry"]: g["bot_id"] for g in grok_entries(merged)}
-    taken.update({name: "" for name in (merged.get("LLM") or {}) if name not in taken})
-    selected = _selected(merged, "LLM")
-    cn_cfg = merged.get("call_names") or {}
-    effective_models = {str(k): call_names._aliases(v) for k, v in (cn_cfg.get("models") or call_names.DEFAULT_MODELS).items()}
-    taken_aliases = {a for aliases in effective_models.values() for a in aliases}
-    changed = []
-    with config_store.edit_custom(path) as data:
-        llm = data.setdefault("LLM", CommentedMap())
-        for bot_id, name in wanted.items():
-            old = current.get(bot_id)
-            if old and old["bot_name"] == name:
-                continue
-            entry_name = old["entry"] if old else grok_entry_name(name, bot_id, taken)
-            taken[entry_name] = bot_id
-            block = llm.get(entry_name)
-            if not isinstance(block, CommentedMap):
-                block = CommentedMap()
-                llm[entry_name] = block
-            block["type"] = "grok_bot"
-            block["bot_id"] = bot_id
-            block["bot_name"] = name
-            changed.append(entry_name)
-            alias = _default_grok_alias(name, taken_aliases) if not old else ""
-            if alias:
-                # 自定义文件里还没有称呼表时，先把当前生效的（默认只有 Claude）抄进去，再加这个 Bot
-                cn = data.setdefault("call_names", CommentedMap())
-                models = cn.get("models")
-                if not isinstance(models, CommentedMap):
-                    models = CommentedMap((k, CommentedSeq(v)) for k, v in effective_models.items())
-                    cn["models"] = models
-                models[entry_name] = CommentedSeq([alias])
-                taken_aliases.add(alias)
-        for bot_id, old in current.items():
-            if bot_id in wanted:
-                continue
-            if old["entry"] == selected:
-                raise ValueError(f"{old['bot_name']} 正在作为默认模型使用，先到“大模型”页换掉再取消")
-            llm.pop(old["entry"], None)
-            models = (data.get("call_names") or {}).get("models")
-            if isinstance(models, dict):
-                models.pop(old["entry"], None)
-            changed.append(old["entry"])
-    return changed
-
-
-def _check_positive_number(name: str, raw) -> None:
-    try:
-        if float(str(raw).strip()) <= 0:
-            raise ValueError
-    except ValueError:
-        raise ValueError(f"{name} 需要是大于 0 的数字")
-
-
-def _check_non_negative_number(name: str, raw) -> None:
-    try:
-        if float(str(raw).strip()) < 0:
-            raise ValueError
-    except ValueError:
-        raise ValueError(f"{name} 需要是 0 或正数")
-
-
-def save_claude_cli(payload: dict, merged: dict, path: Path = None) -> list:
-    """校验后写入 ClaudeCLI 条目，返回实际修改的字段。"""
-    entry = _entry(merged, "LLM", CLAUDE_CLI_ENTRY)
-    if entry.get("type") != "claude_cli":
-        raise KeyError(CLAUDE_CLI_ENTRY)
-    payload = dict(payload or {})
-    # 权限级别和联网开关换算成 permission_mode + allowed_tools
-    if "level" in payload or "web" in payload:
-        level_value = payload.pop("level", None) or claude_level(entry)
-        web = bool(payload.pop("web", claude_web(entry)))
-        if level_value == "custom":
-            tools = [t for t in entry.get("allowed_tools") or [] if t not in catalog.CLAUDE_WEB_TOOLS]
-            mode = entry.get("permission_mode") or "default"
-        else:
-            level = catalog.CLAUDE_LEVEL_BY_VALUE.get(level_value)
-            if level is None:
-                raise ValueError("权限级别只能是 只读、可编辑、Auto")
-            tools, mode = list(level["tools"]), level["mode"]
-        payload["allowed_tools"] = tools + (catalog.CLAUDE_WEB_TOOLS if web else [])
-        payload["permission_mode"] = mode
-    if "model" in payload:
-        model = str(payload["model"] or "").strip()
-        if model and not re.fullmatch(r"[\w.\-\[\]]+", model):
-            raise ValueError("模型名称只能包含字母、数字、点和横线，例如 haiku 或 claude-sonnet-5-5")
-    if "effort" in payload and str(payload["effort"] or "").strip() not in CLAUDE_EFFORT_VALUES:
-        raise ValueError("思考力度只能是 低、中、高、超高、最高")
-    if "permission_mode" in payload and str(payload["permission_mode"] or "").strip() not in CLAUDE_PERMISSION_VALUES:
-        raise ValueError("权限模式不支持这个值")
-    if "workdir" in payload and not str(payload["workdir"] or "").strip():
-        raise ValueError("工作目录不能为空")
-    if "allowed_tools" in payload:
-        tools = payload["allowed_tools"]
-        items = tools if isinstance(tools, list) else re.split(r"[,，\s]+", str(tools))
-        items = [str(t).strip() for t in items if str(t).strip()]
-        bad = [t for t in items if not TOOL_NAME.match(t)]
-        if bad:
-            raise ValueError(f"工具名不对：{', '.join(bad)}")
-        payload["allowed_tools"] = items
-    # 这几项填 0 有特别含义（见 claude_cli.py）：单轮、无响应超时 0 是不限制，空闲关闭 0 是每轮结束就关进程，
-    # 自动接续 0 是不自动接续，后台最长 0 是不转后台（打断就停）
-    for name in ("turn_timeout_seconds", "stall_timeout_seconds", "idle_timeout_seconds", "resume_window_minutes",
-                 "background_max_seconds", "background_after_seconds"):
-        if name in payload:
-            _check_non_negative_number(name, payload[name])
-    if "filler_delay_seconds" in payload:
-        _check_positive_number("filler_delay_seconds", payload["filler_delay_seconds"])
-    raw = str(payload.get("progress_interval_seconds", "")).strip()
-    if raw:  # 留空表示用默认值，0 表示关闭进度提示
-        try:
-            if float(raw) < 0:
-                raise ValueError
-        except ValueError:
-            raise ValueError("进度提示间隔需要是 0 或正数，0 表示关闭")
-    return config_store.update_entry("LLM", CLAUDE_CLI_ENTRY, payload, merged, path)
-
-
-def save_vendor(vendor_id: str, payload: dict, merged: dict, path: Path = None) -> list:
-    """保存某个 API 厂商的接口地址、模型和 Key。条目不存在时按 OpenAI 兼容类型新建。"""
-    vendor = catalog.VENDOR_BY_ID.get(vendor_id)
-    if vendor is None:
-        raise KeyError(vendor_id)
-    entry = _entry(merged, "LLM", vendor["entry"])
-    if entry and entry.get("type") != "openai":
-        raise ValueError(f"配置里的 {vendor['entry']} 不是 OpenAI 兼容类型，请在配置文件里改名或删掉它")
-    payload = payload or {}
-    base_url = str(payload.get("base_url") or "").strip()
-    model = str(payload.get("model") or "").strip()
-    api_key = str(payload.get("api_key") or "").strip()
-    if not URL.match(base_url):
-        raise ValueError("接口地址需要以 http:// 或 https:// 开头")
-    if not model:
-        raise ValueError("请填写模型名称")
-
-    url_field = _url_field(entry)
-    changes = {}
-    if base_url != _text(entry.get(url_field)):
-        changes[url_field] = base_url
-    if model != _text(entry.get("model_name")):
-        changes["model_name"] = model
-    if api_key:
-        if any(c.isspace() for c in api_key):
-            raise ValueError("API Key 里不能有空格或换行")
-        if api_key != entry.get("api_key"):
-            changes["api_key"] = api_key
-    if not entry:
-        changes = {"type": "openai", **changes}
-        changes.setdefault("api_key", "")
-    if not changes:
-        return []
-    with config_store.edit_custom(path) as data:
-        target = data.setdefault("LLM", CommentedMap()).setdefault(vendor["entry"], CommentedMap())
-        for field, value in changes.items():
-            target[field] = value
-    return [f for f in changes if f != "type"]
-
-
-def vendor_test_config(vendor_id: str, payload: dict, merged: dict) -> dict:
-    """测试连接用的 LLM 配置：页面上还没保存的值优先，Key 留空时用已保存的。"""
-    vendor = catalog.VENDOR_BY_ID.get(vendor_id)
-    if vendor is None:
-        raise KeyError(vendor_id)
-    entry = _entry(merged, "LLM", vendor["entry"])
-    payload = payload or {}
-    base_url = str(payload.get("base_url") or "").strip() or _text(entry.get(_url_field(entry))) or vendor["base_url"]
-    model = str(payload.get("model") or "").strip() or _text(entry.get("model_name"))
-    api_key = str(payload.get("api_key") or "").strip() or _text(entry.get("api_key"))
-    if not URL.match(base_url):
-        raise ValueError("接口地址需要以 http:// 或 https:// 开头")
-    if not model:
-        raise ValueError("请填写模型名称")
-    if not api_key and vendor_id != "custom":
-        raise ValueError("请先填写 API Key")
-    config = {k: v for k, v in entry.items() if k not in ("url", "base_url")}
-    config.update({"type": "openai", "base_url": base_url, "model_name": model,
-                   "api_key": api_key or "not-needed", "max_tokens": 20, "timeout": 20})
-    return config
-
-
-def desired_intent(merged: dict, llm_name: str, path: Path = None):
-    """切换大模型后意图识别应该是什么：Claude CLI 只能用 nointent；
-    API 模型恢复用户上次在 API 模式下的选择，没有选过时用 function_call。"""
-    if config_store.entry_type(merged, "LLM", llm_name) == "claude_cli":
-        return "nointent"
-    pref = (config_store.load_custom(path).get("admin") or {}).get("api_intent")
-    if pref in catalog.INTENT_MODES:
-        return pref
-    return "function_call"
+    llm = merged.get("LLM") or {}
+    choices = [{"entry": v["entry"], "vendor": v["id"], "label": v["label"], "model": _text(llm[v["entry"]].get("model_name"))}
+               for v in catalog.LLM_VENDORS if llm_router.model_ready(merged, v["entry"])]
+    listed = {c["entry"] for c in choices}
+    # 不列 type: openai 的：config.yaml 里上游的示例条目（如 LMStudioLLM）不用填就算填好了
+    choices += [{"entry": name, "vendor": "custom", "label": _text(e.get("model_name")), "model": _text(e.get("model_name"))}
+                for name, e in llm.items()
+                if name not in listed and e.get("type") in ("multi_api", "pi") and llm_router.model_ready(merged, name)]
+    return choices
 
 
 # ---------- 语音识别 ----------
@@ -718,6 +373,7 @@ def describe_tts(merged: dict) -> dict:
         "type": entry.get("type", name),
         "voice": str(entry.get("voice") or ""),
         "voices": catalog.EDGE_VOICES,
+        **tts_settings.describe(merged),
     }
 
 
@@ -748,7 +404,6 @@ def describe_intent(merged: dict) -> dict:
     return {
         "selected": name,
         "mode": mode if mode in catalog.INTENT_MODES else "other",
-        "locked": llm_kind(merged) == "cli",
         "plugins": [{**p, "enabled": p["name"] in functions,
                      "needs_config": bool(p.get("config")) and not plugin_configured(merged, p)}
                     for p in catalog.PLUGINS],
@@ -787,52 +442,30 @@ def save_intent_plugins(functions: list, merged: dict, path: Path = None) -> lis
     return ["functions"]
 
 
-def remember_api_intent(mode: str, path: Path = None) -> None:
-    """记住 API 模式下用户选的意图识别，切回 API 模型时恢复。"""
-    if (config_store.load_custom(path).get("admin") or {}).get("api_intent") == mode:
-        return
-    with config_store.edit_custom(path) as data:
-        data.setdefault("admin", CommentedMap())["api_intent"] = mode
-
-
 # ---------- 呼名 ----------
 
 ALIAS_BAD = re.compile(r"[\s,，.。!！?？、~～;；:：\"'“”‘’]")
 
 
 def call_targets(merged: dict) -> list:
-    """可以配称呼的模型：本机 Claude Code，以及已经填好的 API 厂商。
+    """可以配称呼的模型，同 model_choices。
 
-    defaults 是添加这个模型时预填的称呼：本机 Claude Code 用真人录音实测的几种写法，
-    API 厂商只填英文厂商名；Claude API 的 claude 已给本机，自定义没有固定名字，都不预填。"""
-    from core.agent import call_names
-
-    result = []
-    if config_store.entry_type(merged, "LLM", CLAUDE_CLI_ENTRY) == "claude_cli":
-        result.append({"entry": CLAUDE_CLI_ENTRY, "label": "Claude（本机 Claude Code）",
-                       "defaults": list(call_names.DEFAULT_MODELS[CLAUDE_CLI_ENTRY])})
-    for g in grok_entries(merged):
-        if g["bot_id"]:
-            result.append({"entry": g["entry"], "label": f"{g['bot_name']}（Grok Bot）",
-                           "defaults": [g["bot_name"].lower()]})
-    for vendor in catalog.LLM_VENDORS:
-        if describe_vendor(vendor, merged)["configured"]:
-            result.append({"entry": vendor["entry"], "label": f"{vendor['label']}（API）",
-                           "defaults": [] if vendor["id"] in ("claude", "custom") else [vendor["id"]]})
-    return result
+    defaults 是添加这个模型时预填的称呼：API 厂商填英文厂商名；模型服务的模型和自定义没有固定名字，不预填。"""
+    return [{"entry": c["entry"],
+             "label": f"{c['label']}（API）" if c["entry"] in catalog.VENDOR_BY_ENTRY else c["label"],
+             "defaults": [] if c["vendor"] == "custom" else [c["vendor"]]}
+            for c in model_choices(merged)]
 
 
 def describe_call_names(merged: dict) -> dict:
-    from core.agent import call_names, llm_router
+    from core.agent import call_names
 
     cfg = merged.get("call_names") or {}
-    raw = cfg.get("models") or call_names.DEFAULT_MODELS
+    raw = cfg.get("models") or {}
     targets = {t["entry"]: t for t in call_targets(merged)}
     models = []
     for key, value in raw.items():
-        entry = llm_router.entry_name(str(key))
-        if any(m["entry"] == entry for m in models):
-            continue
+        entry = str(key)
         t = targets.get(entry)
         models.append({"entry": entry, "label": t["label"] if t else entry, "aliases": call_names._aliases(value),
                        "ready": t is not None})

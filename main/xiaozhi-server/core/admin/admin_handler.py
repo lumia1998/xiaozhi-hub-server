@@ -5,7 +5,7 @@
 - 登录后用 HttpOnly + SameSite=Strict 的 cookie 保持会话；写操作只接受 JSON 请求。
 - API Key 只写不读：接口永远不返回完整的 Key。
 
-页面使用的接口（/admin/api/llm、asr、tts、intent 等）只暴露后台要管理的内容，并做取值校验。
+页面使用的接口（/admin/api/model-services、asr、tts、intent 等）只暴露后台要管理的内容，并做取值校验。
 
 本机设备接口（/kiosk/*）给和网关装在同一台机器上的设备客户端用（例如带屏幕的语音终端），不用登录，
 只接受本机直接发来的请求，见 _from_this_machine。
@@ -24,26 +24,21 @@ from pathlib import Path
 from aiohttp import web
 
 from config.logger import setup_logging
-from core.admin import auth, catalog, config_store, connections, pages, pipeline, plugin_settings, updater
-from core.admin.grokbot import GrokBotAdmin
-from core.admin.status import _claude_version, collect_status
-from core.agent import chat_history, llm_router, reports
-from core.agent.agent_session import ErrorKind
-from core.agent.grokbot_client import GrokBotError
+from core.admin import auth, catalog, config_store, connections, pages, pipeline, plugin_settings, tts_settings
+from core.admin import model_services
+from core.agent import extensions
+from core.admin.status import collect_status
+from core.agent import chat_history, llm_router, task_service
+from core.device_pairing import PairingError
 from core.utils.modules_initialize import initialize_modules
 from core.utils.textUtils import EMOJI_MAP
 
 TAG = __name__
 
-# 后台的同步操作（读写配置、测试连接、查 Claude 版本）用自己的线程：默认线程池和语音识别等共用，
+# 后台的同步操作（读写配置、测试连接）用自己的线程：默认线程池和语音识别等共用，
 # 被卡住的操作（如连不上的测试连接）占满它时，保存要排队十几秒，识别也跟着变慢
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="admin")
 
-# 测试连接最多等这么久：连不上（地址被墙时连接不报错、一直没回应）就尽快告诉用户，也不占着线程。
-# connect 只管建立连接（TCP + TLS，走代理、连国外也就一两秒）；模型想多久算在 read 里，
-# 它是两段数据之间最多等多久。测试用流式请求、收到第一个字就停，推理型模型（如 deepseek-reasoner）
-# 先想十几秒再出字也等得到
-TEST_TIMEOUT = {"connect": 10.0, "read": 60.0, "write": 5.0, "pool": 2.0}
 logger = setup_logging()
 COOKIE_NAME = "xz_admin"
 STATIC_DIR = Path(__file__).parent / "static"
@@ -57,6 +52,8 @@ EMOTION_EMOJI = {name: emoji for emoji, name in EMOJI_MAP.items()}
 KIOSK_ASR_MAX_BYTES = 16000 * 2 * 10  # /kiosk/asr 最多 10 秒音频
 KIOSK_TTS_MAX_CHARS = 200  # /kiosk/tts 一次最多合成这么多字（提醒的内容，一两句话）
 KIOSK_TTS_RATE = 24000     # /kiosk/tts 返回的采样率：Edge TTS 原本就是 24 kHz
+ADMIN_TASK_LIFETIME_SECONDS = 1800
+ADMIN_TASK_BUDGET_TOKENS = 12000
 
 
 def _wav(pcm: bytes, rate: int) -> bytes:
@@ -71,47 +68,60 @@ def _wav(pcm: bytes, rate: int) -> bytes:
 
 
 class AdminHandler:
-    def __init__(self, config: dict, ws_server=None, config_path: Path = None, grokbot_credentials: Path = None,
-                 gateway_updater: "updater.Updater" = None):
+    def __init__(self, config: dict, ws_server=None, config_path: Path = None):
         self.config = config
         self.ws_server = ws_server
         self.config_path = config_path
         self.sessions = auth.SessionStore()
         # 后台点了更新网关、网关重启后，接着用重启前的登录（文件在 data/ 下，和配置放在一起）
-        data_dir = Path(config_path).parent if config_path else updater.SERVER_DIR / "data"
+        data_dir = Path(config_path).parent if config_path else config_store.custom_config_path().parent
         self.sessions_handover = data_dir / ".admin-sessions.json"
         if self.sessions.restore(self.sessions_handover):
             logger.bind(tag=TAG).info("更新网关后沿用了更新前的后台登录")
-        self.updater = gateway_updater or updater.Updater()
         self._emotion_runs = {}  # session_id -> {"task", "index", "total", "emotion"}
         self._voice_samples = {}  # 音色 -> mp3 字节（试听缓存）
+        self._tts_preview_slots = asyncio.Semaphore(2)
         self.logger = logger
-        self.grokbot = GrokBotAdmin(grokbot_credentials, logger=logger.bind(tag=TAG))
+        self._model_management_lock = asyncio.Lock()
+        self._mcp_probe_slots = asyncio.Semaphore(2)
+        self.extensions_path = data_dir / 'llm_extensions.json'
 
     def register(self, app: web.Application) -> None:
         app.add_routes(
             [
                 web.get("/admin", self.handle_index),
                 web.get("/admin/", self.handle_index),
+                web.get('/admin/assets/{name}', self.handle_asset),
                 web.get("/admin/api/state", self.handle_state),
                 web.post("/admin/api/setup", self.handle_setup),
                 web.post("/admin/api/login", self.handle_login),
                 web.post("/admin/api/logout", self.handle_logout),
                 web.get("/admin/api/status", self.handle_status),
-                web.get("/admin/api/update", self.handle_update),
-                web.post("/admin/api/update/check", self.handle_update_check),
-                web.post("/admin/api/update/start", self.handle_update_start),
                 web.get("/admin/api/devices", self.handle_devices),
                 web.get("/admin/api/memory", self.handle_memory),
                 web.post("/admin/api/memory/save", self.handle_memory_save),
+                web.post("/admin/api/memory/owner", self.handle_memory_owner),
+                web.post("/admin/api/memory/preferences/save", self.handle_memory_preference_save),
+                web.post("/admin/api/memory/preferences/delete", self.handle_memory_preference_delete),
+                web.get("/admin/api/tasks", self.handle_tasks),
+                web.post("/admin/api/tasks/start", self.handle_task_start),
+                web.post("/admin/api/tasks/cancel", self.handle_task_cancel),
+                web.post("/admin/api/tasks/answer", self.handle_task_answer),
+                web.get("/admin/api/pairing", self.handle_pairing),
+                web.post("/admin/api/pairing/issue", self.handle_pairing_issue),
+                web.post("/admin/api/pairing/revoke", self.handle_pairing_revoke),
+                web.post("/admin/api/pairing/enabled", self.handle_pairing_enabled),
                 web.post("/admin/api/devices/{session_id}/emotion", self.handle_emotion_one),
                 web.post("/admin/api/devices/{session_id}/emotion-test", self.handle_emotion_test),
                 web.post("/admin/api/devices/{session_id}/emotion-test/stop", self.handle_emotion_stop),
-                web.get("/admin/api/llm", self.handle_llm),
-                web.post("/admin/api/llm/claude", self.handle_llm_claude),
-                web.post("/admin/api/llm/vendors/{vendor}", self.handle_llm_vendor),
-                web.post("/admin/api/llm/vendors/{vendor}/test", self.handle_llm_vendor_test),
-                web.post("/admin/api/llm/use", self.handle_llm_use),
+                web.get('/admin/api/model-services', self.handle_model_services),
+                web.post('/admin/api/model-services/discover', self.handle_models_discover),
+                web.post('/admin/api/model-services/probe', self.handle_models_probe),
+                web.post('/admin/api/model-services/use', self.handle_models_use),
+                web.post('/admin/api/persona', self.handle_persona),
+                web.get('/admin/api/extensions', self.handle_extensions),
+                web.post('/admin/api/extensions', self.handle_extensions_save),
+                web.post('/admin/api/extensions/probe', self.handle_extensions_probe),
                 web.get("/admin/api/pipeline", self.handle_pipeline),
                 web.get("/admin/api/asr", self.handle_asr),
                 web.post("/admin/api/vad", self.handle_vad_save),
@@ -123,6 +133,7 @@ class AdminHandler:
                 web.get("/admin/api/tts", self.handle_tts),
                 web.post("/admin/api/tts", self.handle_tts_save),
                 web.get("/admin/api/tts/preview", self.handle_tts_preview),
+                web.post("/admin/api/tts/preview", self.handle_tts_provider_preview),
                 web.get("/admin/api/intent", self.handle_intent),
                 web.post("/admin/api/intent", self.handle_intent_save),
                 web.get("/admin/api/plugin-settings/{id}", self.handle_plugin_settings),
@@ -132,15 +143,8 @@ class AdminHandler:
                 web.post("/admin/api/call-names", self.handle_call_names_save),
                 web.post("/admin/api/call-names/learn", self.handle_call_names_learn),
                 web.post("/admin/api/call-names/learn/stop", self.handle_call_names_learn_stop),
-                web.get("/admin/api/grokbot", self.handle_grokbot),
-                web.post("/admin/api/grokbot/login", self.handle_grokbot_login),
-                web.post("/admin/api/grokbot/login/cancel", self.handle_grokbot_login_cancel),
-                web.post("/admin/api/grokbot/logout", self.handle_grokbot_logout),
-                web.post("/admin/api/grokbot/bots/refresh", self.handle_grokbot_refresh),
-                web.post("/admin/api/grokbot/bots", self.handle_grokbot_bots),
                 web.get("/kiosk/llm", self.handle_kiosk_llm),
                 web.post("/kiosk/llm/use", self.handle_kiosk_llm_use),
-                web.post("/kiosk/reports", self.handle_kiosk_reports),
                 web.post("/kiosk/asr", self.handle_kiosk_asr),
                 web.post("/kiosk/tts", self.handle_kiosk_tts),
                 web.get("/kiosk/chat/history", self.handle_kiosk_chat_history),
@@ -201,6 +205,13 @@ class AdminHandler:
         html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
         return web.Response(text=html, content_type="text/html", headers=SECURITY_HEADERS)
 
+    async def handle_asset(self, request: web.Request):
+        name = request.match_info['name']
+        if name not in ('tts-page.js', 'tts-page.css', 'models-page.js', 'models-page.css',
+                        'extensions-page.js', 'memory-page.js', 'task-page.js', 'admin-shell.js', 'admin-theme.css', 'admin-icons.svg', 'radix-colors.css'):
+            raise web.HTTPNotFound()
+        return web.FileResponse(STATIC_DIR / name, headers=SECURITY_HEADERS)
+
     async def handle_state(self, request: web.Request):
         return self._json(
             {
@@ -248,6 +259,15 @@ class AdminHandler:
     def _running(self, section: str):
         return (self.config.get("selected_module") or {}).get(section)
 
+    async def _update_task_worker(self):
+        """Refresh the worker's enabled state after a committed LLM config change."""
+        worker = getattr(self.ws_server, "task_worker", None) if self.ws_server is not None else None
+        if worker is not None:
+            try:
+                await self._blocking(worker.update_config, self.config)
+            except Exception as e:
+                self.logger.bind(tag=TAG).warning(f"后台任务 worker 配置更新失败: {type(e).__name__}")
+
     async def _apply_if_selected(self, section: str, name: str, changed: list) -> dict:
         """保存条目后：改的是正在使用的条目才热加载，否则只保存。
 
@@ -259,6 +279,8 @@ class AdminHandler:
         if (merged.get("selected_module") or {}).get(section) != name:
             if name in (merged.get(section) or {}):
                 self.config.setdefault(section, {})[name] = copy.deepcopy(merged[section][name])
+                if section == "LLM":
+                    await self._update_task_worker()
             return {"applied": True, "note": "已保存"}
         return await self._apply(section)
 
@@ -304,6 +326,8 @@ class AdminHandler:
 
         if section == "TTS" or self.ws_server is None:
             commit()
+            if section == "LLM":
+                await self._update_task_worker()
             if section == "TTS":
                 return {"applied": True, "note": "已保存，设备重新连接后生效"}
             return {"applied": False, "note": "已保存，重启服务后生效"}
@@ -317,25 +341,15 @@ class AdminHandler:
             async with self.ws_server.config_lock:
                 modules = await self._blocking(initialize_modules, self.logger, candidate, **{flags[section]: True})
                 commit()
-                old = getattr(self.ws_server, attr, None)
                 setattr(self.ws_server, attr, modules[key])
-            self._retire(old, modules[key])
+                if section == "LLM":
+                    await self._update_task_worker()
             return {"applied": True, "note": "已生效，设备重新连接后使用新配置"}
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"热加载 {section} 失败: {e}")
             error = str(e).strip().rstrip("。.") or type(e).__name__
             return {"applied": False, "failed": True, "error": error,
                     "note": f"已保存，但加载失败：{error}。服务仍在使用原来的配置，请检查后重试"}
-
-    def _retire(self, old, new) -> None:
-        """通知被替换的旧实例退役（如 claude_cli 在连接都关闭后结束后台线程）。
-        已连接的设备仍在用旧实例，所以不能直接关掉；出错也不影响这次切换。"""
-        if old is None or old is new or not callable(getattr(old, "shutdown", None)):
-            return
-        try:
-            old.shutdown()
-        except Exception as e:
-            self.logger.bind(tag=TAG).warning(f"旧实例退役出错: {e}")
 
     # ---------- 呼名 ----------
 
@@ -377,62 +391,6 @@ class AdminHandler:
             if conn is not None:
                 conn.config[key] = copy.deepcopy(value)
 
-    # ---------- Grok Bot ----------
-
-    async def handle_grokbot(self, request: web.Request):
-        self._require_login(request)
-        merged = await self._blocking(self._merged)
-        return self._json({"ok": True, **pages.describe_grok_bot(merged), **self.grokbot.status()})
-
-    async def handle_grokbot_login(self, request: web.Request):
-        self._require_login(request)
-        url = await self.grokbot.start_login()
-        return self._json({"ok": True, "url": url, **self.grokbot.status()})
-
-    async def handle_grokbot_login_cancel(self, request: web.Request):
-        self._require_login(request)
-        await self.grokbot.cancel_login()
-        return self._json({"ok": True, **self.grokbot.status()})
-
-    async def handle_grokbot_logout(self, request: web.Request):
-        self._require_login(request)
-        await self.grokbot.logout()
-        return self._json({"ok": True, **self.grokbot.status()})
-
-    async def handle_grokbot_refresh(self, request: web.Request):
-        self._require_login(request)
-        try:
-            bots = await self.grokbot.fetch_bots()
-        except GrokBotError as e:
-            return self._error(f"读取 Bot 列表失败：{e.detail}", 400 if e.kind == ErrorKind.AUTH else 502)
-        return self._json({"ok": True, "bots": bots, **self.grokbot.status()})
-
-    async def handle_grokbot_bots(self, request: web.Request):
-        """同步勾选的 Bot：每个 Bot 一个 LLM 条目，呼名页据此列出可配称呼的模型。"""
-        self._require_login(request)
-        body = await self._read_json(request)
-        try:
-            merged = await self._blocking(self._merged)
-            changed = await self._blocking(pages.save_grok_bots, body, merged, self.config_path)
-        except ValueError as e:
-            return self._error(str(e), 400)
-        note = "已保存，马上生效" if changed else "没有修改"
-        if changed:
-            new_merged = await self._blocking(self._merged)
-            # 新条目马上可用（呼名时按条目名创建实例），不用重启；被取消的 Bot 的称呼也一并去掉
-            self._push_config("LLM", new_merged.get("LLM") or {})
-            self._push_config("call_names", new_merged.get("call_names") or {})
-            self.logger.bind(tag=TAG).info(f"管理后台更新了 Grok Bot 条目: {', '.join(changed)}")
-            # Bot 的名字会自动并入热词（和呼名页保存时一样），要重新加载语音识别才生效
-            if pages.describe_hotwords(new_merged)["supported"] and self._running("ASR") == \
-                    (new_merged.get("selected_module") or {}).get("ASR"):
-                result = await self._apply("ASR")
-                if result.get("failed"):
-                    note += f"；热词重新加载失败：{result['error']}"
-        if changed and any(c not in (new_merged.get("LLM") or {}) for c in changed):
-            note += "；取消的 Bot 对正连着的设备要等它重新连接才生效"
-        return self._json({"ok": True, "changed": changed, "note": note})
-
     async def handle_call_names_learn(self, request: web.Request):
         self._require_login(request)
         from core.agent.call_names import learner
@@ -466,186 +424,120 @@ class AdminHandler:
 
     # ---------- 更新网关 ----------
 
-    async def handle_update(self, request: web.Request):
-        """当前版本、最近一次检查的结果、最近一次更新的进度（页面在更新期间轮询它）。"""
-        self._require_login(request)
-        version = await self._blocking(self.updater.version)
-        status = await self._blocking(self.updater.status)
-        # 检查之后代码变了（更新过）的话，那次的结果就不算数了，页面会重新检查
-        check = self.updater.last_check
-        if check and check.get("current", {}).get("commit") != version["current"].get("commit"):
-            check = None
-        return self._json({"ok": True, **version, "check": check, "update": status})
-
-    async def handle_update_check(self, request: web.Request):
-        """和远端比较有没有新版本，只取不改；连不上时 check.state 为 error，message 说明原因。"""
-        self._require_login(request)
-        await self._read_json(request)
-        result = await self._blocking(self.updater.check)
-        return self._json({"ok": True, "check": result})
-
-    async def handle_update_start(self, request: web.Request):
-        """在后台运行 scripts/update.sh：快进代码、按需补装依赖、重启网关；失败时退回原来的版本。"""
-        self._require_login(request)
-        await self._read_json(request)
-        # 开始前把登录交接出去：网关重启后页面不用重新登录
-        await self._blocking(self.sessions.save, self.sessions_handover)
-        try:
-            status = await self._blocking(self.updater.start)
-        except updater.UpdateError as e:
-            self.sessions_handover.unlink(missing_ok=True)
-            return self._error(str(e), 409)
-        except OSError as e:
-            self.sessions_handover.unlink(missing_ok=True)
-            return self._error(f"启动更新失败：{e}", 500)
-        self.logger.bind(tag=TAG).info(f"管理后台开始更新网关（来源 {request.remote}）")
-        return self._json({"ok": True, "update": status})
-
-    # ---------- 大模型 ----------
-
-    def _claude_install(self, merged: dict, version: bool = True) -> dict:
-        """version=False 只看装没装：查版本要运行一次 claude --version（设备上约半秒）。"""
-        from core.providers.llm.claude_cli.claude_cli import find_claude_cli
-
-        entry = (merged.get("LLM") or {}).get(pages.CLAUDE_CLI_ENTRY) or {}
-        cli = find_claude_cli(entry.get("cli_path") or None)
-        return {"installed": bool(cli), "path": cli or "", "version": _claude_version(cli) if cli and version else ""}
-
-    async def handle_llm(self, request: web.Request):
+    async def handle_model_services(self, request):
         self._require_login(request)
         merged = await self._blocking(self._merged)
-        data = pages.describe_llm(merged)
-        data["claude"]["install"] = await self._blocking(self._claude_install, merged)
-        data["running"] = self._running("LLM")
-        return self._json({"ok": True, **data})
+        return self._json({'ok': True, **model_services.describe(merged)})
 
-    async def handle_llm_claude(self, request: web.Request):
+    async def handle_models_discover(self, request):
         self._require_login(request)
         body = await self._read_json(request)
-        try:
-            merged = await self._blocking(self._merged)
-            changed = await self._blocking(pages.save_claude_cli, body, merged, self.config_path)
-        except KeyError:
-            return self._error("配置里没有 ClaudeCLI 条目", 404)
-        except ValueError as e:
-            return self._error(str(e), 400)
-        self.logger.bind(tag=TAG).info(f"管理后台更新了 Claude CLI 设置: {', '.join(changed) or '无变化'}")
-        return self._json({"ok": True, "changed": changed,
-                           **await self._apply_if_selected("LLM", pages.CLAUDE_CLI_ENTRY, changed)})
-
-    async def handle_llm_vendor(self, request: web.Request):
-        self._require_login(request)
-        vendor = request.match_info["vendor"]
-        body = await self._read_json(request)
-        started = time.monotonic()
-        try:
-            merged = await self._blocking(self._merged)
-            changed = await self._blocking(pages.save_vendor, vendor, body, merged, self.config_path)
-        except KeyError:
-            return self._error("不支持这个厂商", 404)
-        except ValueError as e:
-            return self._error(str(e), 400)
-        entry = catalog.VENDOR_BY_ID[vendor]["entry"]
-        applied = await self._apply_if_selected("LLM", entry, changed)
-        # 用时记进日志：保存曾经要等十几秒，原因没能复现
-        self.logger.bind(tag=TAG).info(f"管理后台更新了 {vendor} 的 API 设置: {', '.join(changed) or '无变化'}"
-                                       f"（用时 {time.monotonic() - started:.1f} 秒）")
-        return self._json({"ok": True, "changed": changed, **applied})
-
-    @staticmethod
-    def _test_llm(config: dict) -> dict:
-        import httpx
-        import openai
-        from core.providers.llm.openai.openai import LLMProvider
-
-        started = time.time()
-        reply = ""
-        try:
-            provider = LLMProvider({**config, "timeout": TEST_TIMEOUT})
-            provider.client.max_retries = 0   # 默认失败后再试 2 次
-            parts = provider.response("", [{"role": "system", "content": "你是语音助手，回答尽量简短。"},
-                                           {"role": "user", "content": "只回复一个字：好"}])
+        if self._model_management_lock.locked(): return self._error('模型设置正在处理，请稍后重试', 409)
+        async with self._model_management_lock:
             try:
-                for part in parts:   # 收到第一个字就够了：地址、Key、模型都没问题
-                    if part.strip():
-                        reply = part
-                        break
-            finally:
-                parts.close()   # 断开没读完的流
-        except openai.AuthenticationError:
-            return {"ok": False, "error": "API Key 不对或已失效"}
-        except openai.NotFoundError:
-            return {"ok": False, "error": "找不到这个模型或接口地址，请检查模型名称和接口地址"}
-        except openai.RateLimitError:
-            return {"ok": False, "error": "请求太频繁或额度用完了"}
-        except (openai.APIConnectionError, httpx.TransportError) as e:
-            # 读超时：连接建立了、请求也发出去了，是模型那边迟迟不出字，不是网络不通
-            if isinstance(e, httpx.ReadTimeout) or isinstance(e.__cause__, httpx.ReadTimeout):
-                return {"ok": False, "error": f"接口连上了，但模型 {TEST_TIMEOUT['read']:.0f} 秒都没有回应。"
-                                              "可能是模型想得太久或服务太忙，稍后再试；一直这样就换个模型"}
-            return {"ok": False, "error": "连不上接口地址，请检查地址和网络；国外的服务在国内可能要走代理，或者换国内的服务"}
-        except openai.APIStatusError as e:
-            return {"ok": False, "error": f"接口返回错误 {e.status_code}：{str(e.message)[:200]}"}
-        except Exception as e:
-            return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
-        return {"ok": True, "seconds": round(time.time() - started, 1), "reply": reply.strip()[:60]}
+                merged = await self._blocking(self._merged)
+                sid, service, old = model_services.normalized_service(body, merged)
+                report = await model_services.discover(service)
+                if not report['models']:
+                    return self._json({'ok': False, 'error': '未获取到模型，请检查接口地址和密钥', 'discovery': report['discovery']}, 400)
+                await self._blocking(model_services.save_discovered, sid, service, report, merged, self.config_path)
+                fresh = await self._blocking(self._merged)
+                self.config['LLM'] = fresh['LLM']; self.config['model_services'] = fresh['model_services']
+                # A refreshed service can change credentials of a currently selected model.
+                active = self._running('LLM')
+                if (fresh['LLM'].get(active) or {}).get('service_id') == sid:
+                    result = await self._apply('LLM')
+                    if result.get('failed'): return self._error(result['note'], 400)
+                else:
+                    await self._update_task_worker()
+                return self._json({'ok': True, 'id': sid, **model_services.describe(fresh)})
+            except (ValueError, TypeError) as e:
+                return self._error(str(e), 400)
 
-    async def handle_llm_vendor_test(self, request: web.Request):
+    async def _model_probe(self, body):
+        merged = await self._blocking(self._merged)
+        sid, model = body.get('id'), body.get('model')
+        service = (merged.get('model_services') or {}).get(sid)
+        if not service or not isinstance(model, str) or model not in {m['id'] for m in service.get('models', [])}:
+            raise ValueError('请先获取模型列表，再选择模型')
+        report = await self._blocking(model_services.probe_sync, service['base_url'], service.get('api_key', ''), model)
+        await self._blocking(model_services.save_probe, sid, model, report, merged, self.config_path)
+        fresh = await self._blocking(self._merged)
+        self.config['LLM'] = fresh['LLM']; self.config['model_services'] = fresh['model_services']
+        await self._update_task_worker()
+        return model_services.model_entry(service, sid, model), report
+
+    async def handle_models_probe(self, request):
         self._require_login(request)
-        vendor = request.match_info["vendor"]
+        body = await self._read_json(request)
+        if self._model_management_lock.locked(): return self._error('模型设置正在处理，请稍后重试', 409)
+        async with self._model_management_lock:
+            try: name, report = await self._model_probe(body)
+            except (ValueError, TypeError) as e: return self._error(str(e), 400)
+        return self._json({'ok': True, 'entry': name, 'probe': report})
+
+    async def handle_models_use(self, request):
+        self._require_login(request)
+        body = await self._read_json(request)
+        if self._model_management_lock.locked(): return self._error('模型设置正在处理，请稍后重试', 409)
+        async with self._model_management_lock:
+            try:
+                merged = await self._blocking(self._merged)
+                name = body.get('entry')
+                if body.get('id'):
+                    service = (merged.get('model_services') or {}).get(body['id']) or {}
+                    row = next((m for m in service.get('models', []) if m['id'] == body.get('model')), None)
+                    if row is None:raise ValueError('模型不在已保存的列表中')
+                    name = model_services.model_entry(service, body['id'], body['model'])
+                    merged = await self._blocking(self._merged)
+                entry = (merged.get('LLM') or {}).get(name) or {}
+                if entry.get('type') not in ('openai', 'multi_api', 'pi') or not llm_router.model_ready(merged, name):
+                    raise ValueError('模型没有配置好或不可用')
+                self.config['LLM'] = merged['LLM']
+                if self._running('LLM') == name:
+                    result = {'ok': True, **await self._apply('LLM')}
+                    if result.get('failed'): result['ok'] = False
+                else:
+                    result = await self._switch('LLM', name)
+                if result.get('ok'):
+                    await self._update_task_worker()
+                return self._json(result)
+            except (ValueError, TypeError, KeyError) as e: return self._error(str(e), 400)
+
+    async def handle_persona(self, request):
+        self._require_login(request)
         body = await self._read_json(request)
         try:
             merged = await self._blocking(self._merged)
-            config = pages.vendor_test_config(vendor, body, merged)
-        except KeyError:
-            return self._error("不支持这个厂商", 404)
-        except ValueError as e:
-            return self._error(str(e), 400)
-        result = await self._blocking(self._test_llm, config)
-        return self._json(result) if result["ok"] else self._error(result["error"], 400)
+            text = await self._blocking(model_services.save_persona, body.get('persona'), body.get('expected'), merged, self.config_path)
+        except (ValueError, TypeError) as e: return self._error(str(e), 400)
+        self.config['prompt'] = text
+        return self._json({'ok': True, 'persona': text, 'note': '人设已保存，下次对话连接时生效'})
 
-    async def handle_llm_use(self, request: web.Request):
-        """切换到本地 CLI 或某个 API 厂商；意图识别自动跟着切。"""
+    async def handle_extensions(self, request):
+        self._require_login(request)
+        return self._json({'ok': True, **await self._blocking(extensions.describe, self.extensions_path)})
+
+    async def handle_extensions_save(self, request):
         self._require_login(request)
         body = await self._read_json(request)
-        name, result = await self._use_llm(body)
-        if name is None:
-            return result
-        return self._json(result)
-
-    async def _use_llm(self, body: dict):
-        """把默认模型切到 body 指定的（{"kind": "cli"} 或 {"kind": "api", "vendor": ...}）。
-
-        成功返回 (条目名, 结果)；失败返回 (None, 错误响应)。
-        """
-        merged = await self._blocking(self._merged)
-        if body.get("kind") == "cli":
-            name = pages.CLAUDE_CLI_ENTRY
-        else:
-            vendor = catalog.VENDOR_BY_ID.get(str(body.get("vendor") or ""))
-            if vendor is None:
-                return None, self._error("不支持这个厂商", 404)
-            name = vendor["entry"]
-            if not pages.describe_vendor(vendor, merged)["configured"]:
-                return None, self._error(
-                    f"{vendor['label']} 还没配置好，请先填写接口地址、模型和 API Key 并保存", 400)
         try:
-            result = await self._switch("LLM", name)
-        except KeyError:
-            return None, self._error(f"配置里没有 {name}", 404)
-        if not result["ok"]:
-            return None, self._error(result["note"], 400)
+            data = await self._blocking(extensions.save, body, self.extensions_path)
+            return self._json({'ok': True, **data, 'note': '已保存。MCP 在下次对话连接时生效，Skill 在下次提问时生效。'})
+        except (ValueError, TypeError) as e:
+            return self._error(str(e), 400)
 
-        merged = await self._blocking(self._merged)
-        intent = await self._blocking(pages.desired_intent, merged, name, self.config_path)
-        if config_store.entry_type(merged, "Intent") != intent:
-            try:
-                intent_result = await self._switch("Intent", pages.intent_entry_name(merged, intent))
-                note = "意图识别已自动改为" + ("“不用插件”" if intent == "nointent" else "“用插件”")
-                result["note"] += "；" + (note if intent_result["ok"] else intent_result["note"])
-            except KeyError:
-                result["note"] += f"；配置里没有 {intent}，请检查意图识别"
-        return name, result
+    async def handle_extensions_probe(self, request):
+        self._require_login(request)
+        body = await self._read_json(request)
+        if self._mcp_probe_slots.locked():
+            return self._error('已有连接测试正在进行，请稍后重试', 429)
+        try:
+            async with self._mcp_probe_slots:
+                result = await extensions.probe(body, self.extensions_path)
+            return self._json(result, 200 if result['ok'] else 400)
+        except (ValueError, TypeError) as e:
+            return self._error(str(e), 400)
 
     # ---------- 本机设备接口 ----------
 
@@ -658,7 +550,7 @@ class AdminHandler:
         return request.remote in ("127.0.0.1", "::1")
 
     async def handle_kiosk_llm(self, request: web.Request):
-        """可选的模型（装了 Claude Code 的话排第一个，然后是配好的 API 厂商、勾选的 Grok Bot）和当前选中的。
+        """可选的模型（配好的 API 厂商和模型服务里的模型）和当前选中的。
 
         带 ?device=<device-id> 时，selected 是这台设备实际会用的模型：它上次切到的（呼名或在这里切换），
         还可用的话；default 始终是后台默认模型。
@@ -669,30 +561,19 @@ class AdminHandler:
         return self._json({"ok": True, **await self._kiosk_models(merged, request.query.get("device"))})
 
     async def _kiosk_models(self, merged: dict, device: str = None) -> dict:
-        data = pages.describe_llm(merged)
-        options = [
-            {"kind": "api", "vendor": v["id"], "label": v["label"], "entry": v["entry"], "model": v["model"]}
-            for v in data["vendors"] if v.get("configured")
-        ]
-        install = await self._blocking(self._claude_install, merged, version=False)
-        if install.get("installed"):
-            options.insert(0, {"kind": "cli", "vendor": "claude-code", "label": "Claude Code",
-                               "entry": pages.CLAUDE_CLI_ENTRY, "model": data["claude"]["values"].get("model", "")})
-        options += [{"kind": "grok", "vendor": "grok_bot", "label": b["bot_name"], "entry": b["entry"], "model": "Grok Bot"}
-                    for b in data["grok"]["bots"] if llm_router.model_ready(merged, b["entry"])]
-        selected = data["selected"]
+        options = [{"kind": "api", **c} for c in pages.model_choices(merged)]
+        default = (merged.get("selected_module") or {}).get("LLM")
+        selected = default
         if device:
             name = (llm_router.store().get(device) or {}).get("model")
-            if name and llm_router.model_ready(merged, name) and any(o["entry"] == name for o in options):
+            if name and any(o["entry"] == name for o in options):
                 selected = name
-        return {"selected": selected, "default": data["selected"], "kind": data["kind"], "vendor": data["vendor"],
-                "options": options}
+        return {"selected": selected, "default": default, "options": options}
 
     async def handle_kiosk_llm_use(self, request: web.Request):
-        """把这台设备切到 body 指定的模型（{"kind": "cli"}、{"kind": "api", "vendor": …}、{"kind": "grok", "entry": …}，
-        都带 "device"），同呼名切换：只这台设备切过去并记住，在线的连接马上跟着切（新模型从新对话开始），
-        意图识别跟着这台设备的模型走（llm_router.intent_mode）。后台默认模型和全局意图识别不变，
-        不写配置、不重建默认实例；默认模型只在管理后台改。
+        """把这台设备切到 body 指定的模型（{"entry": …}，或只给 {"vendor": …}；都带 "device"），同呼名切换：
+        只这台设备切过去并记住，在线的连接马上跟着切。后台默认模型不变，不写配置、不重建默认实例；
+        默认模型只在管理后台改。
 
         返回切换后的模型列表（同 GET /kiosk/llm?device=…），设备不用再查一次。
         """
@@ -703,22 +584,14 @@ class AdminHandler:
         if not device:
             return self._error("缺少 device", 400)
         merged = await self._blocking(self._merged)
-        kind = body.get("kind")
-        if kind == "grok":
-            name = str(body.get("entry") or "")
-            if name not in {b["entry"] for b in pages.grok_entries(merged)} or not llm_router.model_ready(merged, name):
-                return self._error("没有这个 Grok Bot，请先在管理后台的 Grok Bot 页勾选", 404)
-        elif kind == "cli":
-            name = pages.CLAUDE_CLI_ENTRY
-            if name not in (merged.get("LLM") or {}):
-                return self._error(f"配置里没有 {name}", 404)
-        else:
+        name = str(body.get("entry") or "")
+        if not name:
             vendor = catalog.VENDOR_BY_ID.get(str(body.get("vendor") or ""))
             if vendor is None:
                 return self._error("不支持这个厂商", 404)
             name = vendor["entry"]
-            if not pages.describe_vendor(vendor, merged)["configured"]:
-                return self._error(f"{vendor['label']} 还没配置好，请先填写接口地址、模型和 API Key 并保存", 400)
+        if not any(c["entry"] == name for c in pages.model_choices(merged)):
+            return self._error(f"{llm_router.model_label(name)} 还没配置好", 400)
         # 后台保存过、但没设成默认的条目，运行中的配置里还是旧的（或没有）：补进去，切换时照它创建实例
         running = self.config.setdefault("LLM", {})
         if running.get(name) != merged["LLM"][name]:
@@ -745,22 +618,6 @@ class AdminHandler:
         self.logger.bind(tag=TAG).info(f"设备 {device} 切换模型为 {name}（只这台设备）")
         return self._json({"ok": True, "applied": True, "note": "已切换，这台设备之后都用它",
                            **await self._kiosk_models(merged, device)})
-
-    async def handle_kiosk_reports(self, request: web.Request):
-        """{"device", "quiet", "play"}：返回这台设备有几条待汇报。
-
-        quiet：设备是否在睡眠时段（期间不主动念）。每次查询都带上，网关重启后不会丢。
-        play：用户点了"有一条待汇报"，马上在设备的连接上念（睡眠时段也念）；playing 表示已安排，设备没连着时为 false。
-        """
-        if not self._from_this_machine(request):
-            return self._error("仅限本机", 403)
-        body = await self._read_json(request)
-        device = str(body.get("device") or "")
-        if not device:
-            return self._error("缺少 device", 400)
-        reports.set_quiet(device, bool(body.get("quiet")))
-        playing = bool(body.get("play")) and reports.deliver_now(device)
-        return self._json({"ok": True, "count": reports.count(device), "playing": playing})
 
     async def handle_kiosk_asr(self, request: web.Request):
         """只识别、不对话：body 是 10 秒以内的 16kHz 单声道 16 位 PCM，返回 {"text", "ms"}。
@@ -834,8 +691,7 @@ class AdminHandler:
     async def handle_kiosk_chat_clear(self, request: web.Request):
         """{"device", "memory_only"?}：清除这台设备的聊天记录（所有模型），和语音"清除聊天记录"同一套。
 
-        只清本机：库里的记录和记忆、在线连接里网关这边的对话；Claude Code、Grok Bot 自己的会话和记忆不碰。
-        memory_only：只清记忆，记录留着。返回 {"deleted", "agents": 聊过的 Claude Code / Grok Bot}。"""
+        清库里的记录和记忆、在线连接里的对话。memory_only：只清记忆，记录留着。返回 {"deleted"}。"""
         if not self._from_this_machine(request):
             return self._error("仅限本机", 403)
         body = await self._read_json(request)
@@ -844,8 +700,7 @@ class AdminHandler:
             return self._error("缺少 device", 400)
         online = [c for c in (connections.get(i["session_id"]) for i in connections.snapshot()
                               if i["device_id"] == device) if c is not None]
-        merged = await self._blocking(self._merged)
-        result = await self._blocking(chat_history.clear, device, merged, bool(body.get("memory_only")), online)
+        result = await self._blocking(chat_history.clear, device, bool(body.get("memory_only")), online)
         return self._json({"ok": True, **result})
 
     # ---------- 工作原理 ----------
@@ -991,6 +846,17 @@ class AdminHandler:
     async def handle_tts_save(self, request: web.Request):
         self._require_login(request)
         body = await self._read_json(request)
+        if 'provider' in body:
+            try:
+                merged = await self._blocking(self._merged)
+                name, changed = await self._blocking(tts_settings.save, body['provider'], body.get('values', {}), merged, self.config_path)
+            except (ValueError, TypeError) as e:
+                return self._error(str(e), 400)
+            fresh = await self._blocking(self._merged)
+            self.config['TTS'] = fresh['TTS']
+            self.config.setdefault('selected_module', {})['TTS'] = name
+            self.logger.bind(tag=TAG).info(f'管理后台切换语音服务: {name}')
+            return self._json({'ok': True, 'changed': changed, 'note': '已保存，设备下一次连接时生效'})
         try:
             merged = await self._blocking(self._merged)
             changed = await self._blocking(pages.save_tts_voice, str(body.get("voice") or ""), merged, self.config_path)
@@ -1026,6 +892,30 @@ class AdminHandler:
         return web.Response(body=audio, content_type="audio/mpeg",
                             headers={**SECURITY_HEADERS, "Cache-Control": "private, max-age=86400"})
 
+    async def handle_tts_provider_preview(self, request: web.Request):
+        self._require_login(request)
+        body = await self._read_json(request)
+        text = body.get('text', tts_settings.SAMPLE)
+        if not isinstance(text, str) or not 1 <= len(text.strip()) <= 200:
+            return self._error('试听文字需要 1 到 200 个字', 400)
+        try:
+            merged = await self._blocking(self._merged)
+            # Validate before reserving network work. Preview never persists credentials/config.
+            tts_settings.prepare(body.get('provider'), body.get('values', {}), merged)
+            if self._tts_preview_slots.locked():
+                return self._error('已有试听正在生成，请稍后重试', 429)
+            async with self._tts_preview_slots:
+                audio = await tts_settings.preview(body.get('provider'), body.get('values', {}), merged, text.strip())
+        except (ValueError, TypeError) as e:
+            return self._error(str(e), 400)
+        except Exception as e:
+            from core.providers.tts.cloud_http import SynthesisError
+            # Do not include upstream bodies, URLs with keys, or raw exception text.
+            message = str(e) if isinstance(e, SynthesisError) else '试听失败，请检查语音服务的网络、密钥和音色权限'
+            self.logger.bind(tag=TAG).warning(f'TTS 试听失败: {type(e).__name__}')
+            return self._error(message, 502)
+        return web.Response(body=audio, content_type='audio/mpeg', headers=SECURITY_HEADERS)
+
     # ---------- 意图识别 ----------
 
     async def handle_intent(self, request: web.Request):
@@ -1040,8 +930,6 @@ class AdminHandler:
         if mode not in catalog.INTENT_MODES:
             return self._error("意图识别只能选“不用插件”或“用插件”", 400)
         merged = await self._blocking(self._merged)
-        if pages.llm_kind(merged) == "cli" and mode != "nointent":
-            return self._error("使用 Claude Code 时只能选“不用插件”", 400)
         notes = []
         try:
             if "functions" in body:
@@ -1051,10 +939,6 @@ class AdminHandler:
                     name = pages.intent_entry_name(merged, "function_call")
                     if (merged.get("selected_module") or {}).get("Intent") == name:
                         notes.append((await self._apply("Intent"))["note"])
-            if pages.llm_kind(merged) != "cli":
-                await self._blocking(pages.remember_api_intent, mode, self.config_path)
-                # 设备切到非默认的 API 模型时按它选意图识别（llm_router.intent_mode），要马上用上新的选择
-                self.config.setdefault("admin", {})["api_intent"] = mode
             result = await self._switch("Intent", pages.intent_entry_name(merged, mode))
         except KeyError:
             return self._error(f"配置里没有 {mode}", 404)
@@ -1127,17 +1011,30 @@ class AdminHandler:
     # ---------- 记忆（聊天记录总结） ----------
 
     async def handle_memory(self, request: web.Request):
-        """每台设备的记忆全文、更新时间、存了哪些模型的记录。"""
+        """每台设备的记忆全文、偏好、归属和模型记录。"""
         self._require_login(request)
         merged = await self._blocking(self._merged)
         cfg = chat_history.settings(merged)
         online = {d["device_id"] for d in connections.snapshot() if d.get("device_id")}
-        devices = await self._blocking(chat_history.describe_memories, merged)
+        devices = await self._blocking(chat_history.describe_memories)
+        mappings = await self._blocking(chat_history.owner_mappings)
+        by_device = {str(row.get("device")): row for row in mappings if row.get("device")}
+        known = {str(d.get("device")) for d in devices if d.get("device")}
+        for device in sorted(online | (set(by_device) - known)):
+            if device not in known:
+                devices.append({"device": device, "memory": {"summary": "", "pinned": "", "version": 0},
+                                "temporary": 0, "expires_at": None, "models": []})
         for d in devices:
-            d["online"] = d["device"] in online
+            device = str(d["device"])
+            mapping = by_device.get(device) or {}
+            d["owner"] = mapping.get("owner") or d.get("owner") or device
+            d["owner_version"] = mapping.get("version", d.get("owner_version", 0))
+            d["preferences"] = await self._blocking(chat_history.list_preferences, d["owner"])
+            d["online"] = device in online
+            d['label'] = '我的音箱' if len(devices) == 1 else d['device']
         return self._json({"ok": True, "devices": devices,
                            "settings": {k: cfg[k] for k in ("enabled", "summary", "max_messages", "max_tokens",
-                                                            "summary_min", "summary_chars")}})
+                                                            "summary_min", "summary_chars", "use_memory")}})
 
     async def handle_memory_save(self, request: web.Request):
         """{"device", "summary", "version"?}：保存手改的记忆（summary 为空就是清空），下一次请求就用新的。
@@ -1150,26 +1047,293 @@ class AdminHandler:
             return self._error("缺少 device 或 summary", 400)
         if len(summary) > 5000:
             return self._error("记忆最多 5000 字", 400)
+        kind = body.get('kind', 'pinned')
+        if kind not in ('pinned', 'summary'):
+            return self._error('记忆类型不正确', 400)
         version = body.get("version")
         ok, memory = await self._blocking(chat_history.set_memory, device, summary,
-                                          int(version) if isinstance(version, int) else None)
+                                          int(version) if isinstance(version, int) else None, kind)
         if not ok:
             return self._json({"ok": False, "error": "你编辑期间记忆被自动总结更新了，请看过新内容再改", "memory": memory}, 409)
         return self._json({"ok": True, "memory": memory})
 
+    async def handle_memory_owner(self, request: web.Request):
+        """保存设备归属映射；这是记忆分组配置，不是设备认证。"""
+        self._require_login(request)
+        body = await self._read_json(request)
+        device, owner = str(body.get("device") or "").strip(), str(body.get("owner") or "").strip()
+        if not device or not owner or len(device) > 300 or len(owner) > 300:
+            return self._error("设备和归属不能为空", 400)
+        expected = body.get("version")
+        if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0:
+            return self._error("归属版本不正确", 400)
+        old_owner = await self._blocking(chat_history.owner_for_device, device)
+        online = [c for c in (connections.get(i["session_id"]) for i in connections.snapshot()
+                              if i.get("device_id") == device) if c is not None]
+        if old_owner != owner:
+            from core.handle.abortHandle import handleAbortMessage
+            for conn in online:
+                if conn.client_is_speaking or not conn.client_abort:
+                    try:
+                        await handleAbortMessage(conn, drop_audio=True)
+                    except Exception as error:
+                        conn.logger.warning(f"设备归属更新前停止旧会话失败: {type(error).__name__}")
+        try:
+            ok, current = await self._blocking(chat_history.set_device_owner, device, owner, expected)
+        except ValueError as e:
+            return self._error(str(e), 400)
+        if not ok:
+            return self._json({"ok": False, "error": "归属刚刚被修改，请刷新后再保存", "mapping": current}, 409)
+        if old_owner != owner:
+            await self._blocking(task_service.cancel_device_tasks, old_owner, device)
+            await self._blocking(chat_history.clear_dialogues, online)
+        return self._json({"ok": True, "mapping": current})
+
+    async def handle_memory_preference_save(self, request: web.Request):
+        self._require_login(request)
+        body = await self._read_json(request)
+        device = str(body.get("device") or "").strip()
+        topic, content = str(body.get("topic") or "").strip(), str(body.get("content") or "").strip()
+        if not device or not topic or not content:
+            return self._error("设备、主题和内容不能为空", 400)
+        if len(topic) > 100 or len(content) > 2000:
+            return self._error("偏好内容过长", 400)
+        owner = await self._blocking(chat_history.owner_for_device, device)
+        preference_id = body.get("id")
+        if preference_id is not None and (isinstance(preference_id, bool) or not isinstance(preference_id, int) or preference_id < 1):
+            return self._error("偏好编号不正确", 400)
+        expected = body.get("version")
+        if expected is not None and (isinstance(expected, bool) or not isinstance(expected, int) or expected < 0):
+            return self._error("偏好版本不正确", 400)
+        try:
+            ok, row = await self._blocking(chat_history.upsert_preference, owner, topic, content,
+                                           preference_id, expected)
+        except ValueError as e:
+            return self._error(str(e), 400)
+        if not ok:
+            return self._json({"ok": False, "error": "偏好刚刚被修改，请刷新后再保存", "preference": row}, 409)
+        return self._json({"ok": True, "preference": row})
+
+    async def handle_memory_preference_delete(self, request: web.Request):
+        self._require_login(request)
+        body = await self._read_json(request)
+        device = str(body.get("device") or "").strip()
+        preference_id, expected = body.get("id"), body.get("version")
+        if not device or isinstance(preference_id, bool) or not isinstance(preference_id, int) or preference_id < 1:
+            return self._error("设备和偏好编号不正确", 400)
+        if expected is not None and (isinstance(expected, bool) or not isinstance(expected, int) or expected < 0):
+            return self._error("偏好版本不正确", 400)
+        owner = await self._blocking(chat_history.owner_for_device, device)
+        try:
+            ok, row = await self._blocking(chat_history.delete_preference, owner, preference_id, expected)
+        except ValueError as e:
+            return self._error(str(e), 400)
+        if not ok:
+            return self._json({"ok": False, "error": "偏好刚刚被修改，请刷新后再保存", "preference": row}, 409)
+        return self._json({"ok": True, "preference": row})
+
+    def _task_devices(self):
+        online = {str(d.get("device_id")) for d in connections.snapshot() if d.get("device_id")}
+        mapped = {str(d.get("device")) for d in chat_history.owner_mappings() if d.get("device")}
+        recorded = {str(d.get("device")) for d in chat_history.describe_memories() if d.get("device")}
+        tasks = set(task_service.admin_device_ids())
+        return sorted(online | mapped | recorded | tasks)
+
+    def _trusted_device_owner(self, device):
+        resolver = getattr(self.ws_server, "owner_for_device", None) if self.ws_server is not None else None
+        return resolver(device) if callable(resolver) else chat_history.owner_for_device(device)
+
+    async def handle_tasks(self, request: web.Request):
+        """列出当前在线或已配置归属设备的任务；任务按所有者隔离。"""
+        self._require_login(request)
+        requested = str(request.query.get("device") or "").strip()
+        devices = [requested] if requested else await self._blocking(self._task_devices)
+        if requested and requested not in await self._blocking(self._task_devices):
+            return self._error("设备不存在", 404)
+        tasks, owners = [], set()
+        for device in devices:
+            owner = await self._blocking(self._trusted_device_owner, device)
+            if owner in owners:
+                continue
+            owners.add(owner)
+            tasks.extend(await self._blocking(task_service.task_status, owner))
+        tasks.sort(key=lambda t: t.get("updated", 0), reverse=True)
+        worker = getattr(self.ws_server, "task_worker", None) if self.ws_server is not None else None
+        return self._json({"ok": True, "devices": devices, "tasks": tasks[:200],
+                           "worker_available": bool(worker and worker.is_registered())})
+
+    async def handle_task_start(self, request: web.Request):
+        self._require_login(request)
+        body = await self._read_json(request)
+        device = str(body.get("device") or "").strip()
+        text = str(body.get("request") or "").strip()
+        if not device or not text:
+            return self._error("设备和任务内容不能为空", 400)
+        if device not in await self._blocking(self._task_devices):
+            return self._error("设备不存在", 404)
+        owner = await self._blocking(self._trusted_device_owner, device)
+        try:
+            task = await self._blocking(
+                task_service.task_start, owner, device, text,
+                role="research", deadline=time.time() + ADMIN_TASK_LIFETIME_SECONDS,
+                idempotency_key=body.get("idempotency_key"), budget_tokens=ADMIN_TASK_BUDGET_TOKENS)
+        except task_service.TaskError as e:
+            return self._error(str(e), 400)
+        except (TypeError, ValueError) as e:
+            return self._error(str(e), 400)
+        return self._json({"ok": True, "task": task}, 201)
+
+    async def handle_task_cancel(self, request: web.Request):
+        self._require_login(request)
+        body = await self._read_json(request)
+        device, task_id = str(body.get("device") or "").strip(), str(body.get("task_id") or "").strip()
+        if not device or not task_id:
+            return self._error("设备和任务编号不能为空", 400)
+        owner = await self._blocking(self._trusted_device_owner, device)
+        try:
+            task = await self._blocking(task_service.task_cancel, owner, task_id)
+        except task_service.TaskError as e:
+            return self._error(str(e), 400)
+        if task is None:
+            return self._error("任务不存在", 404)
+        return self._json({"ok": True, "task": task})
+
+    async def handle_task_answer(self, request: web.Request):
+        self._require_login(request)
+        body = await self._read_json(request)
+        device = str(body.get("device") or "").strip()
+        task_id, answer = str(body.get("task_id") or "").strip(), str(body.get("answer") or "").strip()
+        if not device or not task_id or not answer:
+            return self._error("设备、任务编号和补充信息不能为空", 400)
+        owner = await self._blocking(self._trusted_device_owner, device)
+        try:
+            task = await self._blocking(task_service.task_answer, owner, task_id, answer)
+        except task_service.TaskError as e:
+            return self._error(str(e), 400)
+        if task is None:
+            return self._error("任务不存在", 404)
+        return self._json({"ok": True, "task": task})
+
     async def handle_devices(self, request: web.Request):
         self._require_login(request)
         devices = connections.snapshot()
-        from core.agent import llm_router
-
         for d in devices:
             d["emotion_test"] = self._emotion_progress(d["session_id"])
             # 这台设备此刻在跟谁说话（呼名切到的模型）；和大模型页的全局默认是两回事
-            d["model_label"] = ("Claude Code" if d.get("model") == llm_router.CLAUDE_CLI_ENTRY
-                                else llm_router.model_label(d["model"])) if d.get("model") else ""
+            d["model_label"] = llm_router.model_label(d["model"]) if d.get("model") else ""
         return self._json({"ok": True, "devices": devices, "now": int(time.time()),
                            "emotions": [{"emotion": name, "emoji": emoji, "label": catalog.EMOTION_LABELS.get(name, name)}
                                         for emoji, name in EMOJI_MAP.items()]})
+
+    def _pairing_store(self):
+        return getattr(self.ws_server, "pairing", None) if self.ws_server is not None else None
+
+    async def handle_pairing(self, request: web.Request):
+        self._require_login(request)
+        merged = await self._blocking(self._merged)
+        auth_config = ((merged.get("server") or {}).get("auth") or {})
+        store = self._pairing_store()
+        records = await self._blocking(store.list) if store is not None else []
+        return self._json({
+            "ok": True,
+            "available": store is not None,
+            "auth_enabled": bool(auth_config.get("enabled")),
+            "enabled": bool((auth_config.get("device_auth") or {}).get("enabled")),
+            "records": records,
+        })
+
+    async def handle_pairing_issue(self, request: web.Request):
+        self._require_login(request)
+        store = self._pairing_store()
+        if store is None:
+            return self._error("设备配对存储尚未就绪", 503)
+        body = await self._read_json(request)
+        device = str(body.get("device") or "").strip()
+        owner = str(body.get("owner") or "").strip()
+        if not device or not owner:
+            return self._error("设备和所有者不能为空", 400)
+        previous_owner = await self._blocking(store.owner_for_device, device)
+        try:
+            token, record = await self._blocking(store.issue, device, owner)
+        except PairingError as e:
+            return self._error(str(e), 400)
+        if previous_owner and previous_owner != owner:
+            await self._blocking(task_service.cancel_device_tasks, previous_owner, device)
+        online = [connections.get(item["session_id"]) for item in connections.snapshot()
+                  if item.get("device_id") == device]
+        for conn in online:
+            if conn is not None:
+                try:
+                    await conn.close()
+                except Exception as exc:
+                    conn.logger.warning(f"更新配对令牌后关闭在线连接失败: {type(exc).__name__}")
+        return self._json({"ok": True, "token": token, "record": record})
+
+    async def handle_pairing_revoke(self, request: web.Request):
+        self._require_login(request)
+        store = self._pairing_store()
+        if store is None:
+            return self._error("设备配对存储尚未就绪", 503)
+        body = await self._read_json(request)
+        device = str(body.get("device") or "").strip()
+        if not device:
+            return self._error("设备不能为空", 400)
+        old_owner = await self._blocking(store.owner_for_device, device)
+        try:
+            changed = await self._blocking(store.revoke, device)
+        except PairingError as e:
+            return self._error(str(e), 400)
+        if not changed:
+            return self._error("没有找到这台设备的配对记录", 404)
+        if old_owner:
+            await self._blocking(task_service.cancel_device_tasks, old_owner, device)
+        online = [connections.get(item["session_id"]) for item in connections.snapshot()
+                  if item.get("device_id") == device]
+        for conn in online:
+            if conn is not None:
+                try:
+                    await conn.close()
+                except Exception as exc:
+                    conn.logger.warning(f"撤销配对后关闭在线连接失败: {type(exc).__name__}")
+        return self._json({"ok": True})
+
+    async def handle_pairing_enabled(self, request: web.Request):
+        self._require_login(request)
+        body = await self._read_json(request)
+        enabled = body.get("enabled")
+        if not isinstance(enabled, bool):
+            return self._error("enabled 必须是布尔值", 400)
+        was_enabled = bool(getattr(self.ws_server, "device_auth_enable", False))
+        if enabled and not was_enabled and self.ws_server is not None:
+            store = self._pairing_store()
+            paired = {row["device_id"] for row in await self._blocking(store.list)} if store is not None else set()
+            online = {item.get("device_id") for item in connections.snapshot() if item.get("device_id")}
+            missing = online - paired
+            if missing:
+                return self._error("先为所有在线设备生成配对令牌，再启用配对校验", 409)
+        merged = await self._blocking(self._merged)
+        auth_config = ((merged.get("server") or {}).get("auth") or {})
+        def save_enabled():
+            with config_store.edit_custom(self.config_path) as custom:
+                server = custom.setdefault("server", {})
+                auth_config = server.setdefault("auth", {})
+                device_auth = auth_config.setdefault("device_auth", {})
+                device_auth["enabled"] = enabled
+
+        try:
+            await self._blocking(save_enabled)
+        except (OSError, TypeError, ValueError) as e:
+            return self._error(f"保存配对设置失败：{e}", 500)
+        if self.ws_server is not None and hasattr(self.ws_server, "update_config"):
+            if not await self.ws_server.update_config():
+                return self._error("配对设置已保存，但服务热更新失败，请重启服务", 500)
+        if enabled and not was_enabled:
+            for conn in connections.all_connections():
+                try:
+                    await conn.close()
+                except Exception as exc:
+                    conn.logger.warning(f"启用配对校验后关闭旧连接失败: {type(exc).__name__}")
+        return self._json({"ok": True, "enabled": enabled})
 
     @staticmethod
     async def _send_emotion(conn, emotion: str):

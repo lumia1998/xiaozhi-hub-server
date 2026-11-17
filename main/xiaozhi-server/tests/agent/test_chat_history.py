@@ -1,22 +1,23 @@
 """聊天记录落盘（core/agent/chat_history）和语音清除（core/agent/clear_command）。"""
 import asyncio
 import json
+import os
+import re
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from core.agent import chat_history, clear_command
-from core.agent.session_store import SessionStore
 from core.utils import reply_progress
 from core.utils.dialogue import Dialogue, Message
+from tests.fake_pi import FakePi
 
 CONFIG = {
     "LLM": {
         "DeepSeekLLM": {"type": "openai", "model_name": "deepseek-chat", "base_url": "https://x", "api_key": "sk-1"},
         "ClaudeAPI": {"type": "openai", "model_name": "claude-haiku-5-5", "base_url": "https://y", "api_key": "sk-2"},
-        "ClaudeCLI": {"type": "claude_cli"},
-        "GrokBot_小助手": {"type": "grok_bot", "bot_id": "bot-1", "bot_name": "小助手"},
     },
     "chat_history": {"max_messages": 6, "max_tokens": 8000, "summary_min": 2},
 }
@@ -25,8 +26,6 @@ CONFIG = {
 def make_conn(device="dev-1", config=None):
     d = Dialogue()
     d.put(Message(role="system", content="你是语音助手"))
-    d.put(Message(role="user", content="给我讲个故事吧", is_temporary=True))  # 工具调用示例
-    d.put(Message(role="assistant", content="好的", is_temporary=True))
     return SimpleNamespace(device_id=device, session_id=f"s-{device}", config=config or CONFIG, dialogue=d,
                            logger=MagicMock(), hub_route=None)
 
@@ -38,7 +37,7 @@ def chat(conn, user, reply):
 
 
 def sent(conn, memory=None):
-    """发给模型的对话（不含系统提示和示例）。"""
+    """发给模型的对话（不含系统提示）。"""
     msgs = conn.dialogue.get_llm_dialogue_with_memory(memory)
     return [(m["role"], m.get("content")) for m in msgs[1:]]
 
@@ -105,7 +104,7 @@ def test_turns_survive_a_new_connection_and_only_recent_ones_are_sent():
     chat_history.load(conn2, conn2.dialogue, "DeepSeekLLM")
     assert sent(conn2) == [("user", "问2"), ("assistant", "答2"), ("user", "问3"), ("assistant", "答3"),
                            ("user", "问4"), ("assistant", "答4")]
-    # 示例和系统提示没有存进库
+    # 系统提示没有存进库
     rows = chat_history.db().recent("dev-1", "DeepSeekLLM", 100)
     assert [r["content"] for r in rows][:2] == ["问0", "答0"] and len(rows) == 10
 
@@ -122,20 +121,9 @@ def test_models_and_devices_are_separate():
     a, b, c = make_conn(), make_conn(), make_conn("dev-2")
     chat_history.load(a, a.dialogue, "DeepSeekLLM")
     chat(a, "我叫小明", "你好小明")
-    chat_history.load(b, b.dialogue, "ClaudeCLI")
+    chat_history.load(b, b.dialogue, "ClaudeAPI")
     chat_history.load(c, c.dialogue, "DeepSeekLLM")
     assert sent(b) == [] and sent(c) == []
-
-
-def test_agent_models_are_recorded_but_not_loaded():
-    conn = make_conn()
-    chat_history.load(conn, conn.dialogue, "ClaudeCLI")
-    chat(conn, "看看日志", "好的")
-    assert conn.dialogue.window is None
-    conn2 = make_conn()
-    chat_history.load(conn2, conn2.dialogue, "ClaudeCLI")
-    assert sent(conn2) == []
-    assert [m["text"] for m in chat_history.history("dev-1", 10)["ClaudeCLI"]] == ["看看日志", "好的"]
 
 
 def test_no_device_id_means_nothing_is_stored():
@@ -145,15 +133,14 @@ def test_no_device_id_means_nothing_is_stored():
     assert chat_history.db().models("dev-1") == [] and len(sent(conn)) == 2
 
 
-def test_sync_updates_and_deletes_and_skips_hints():
+def test_sync_updates_and_deletes():
     conn = make_conn()
     chat_history.load(conn, conn.dialogue, "DeepSeekLLM")
     chat(conn, "讲个故事", "从前有座山，山里有座庙。")
-    conn.dialogue.put(Message(role="user", content="[系统提示] 已达到最大工具调用次数限制"))
     extra = Message(role="assistant", content="多余的一句")
     conn.dialogue.put(extra)
     chat_history.sync(conn)
-    conn.dialogue.dialogue[4].content = "从前有座山……"
+    conn.dialogue.dialogue[2].content = "从前有座山……"
     conn.dialogue.dialogue.remove(extra)
     chat_history.sync(conn)
     rows = chat_history.db().recent("dev-1", "DeepSeekLLM", 10)
@@ -194,6 +181,9 @@ def test_cut_after_the_turn_was_saved_is_synced():
 
 # ---------- 记忆 ----------
 
+AUTO = "从对话整理的长期信息：\n"  # memory_for 给自动整理的记忆加的标题
+
+
 class FakeLLM:
     def __init__(self, reply="- 用户叫小明，喜欢爬山"):
         self.reply = reply
@@ -211,28 +201,32 @@ def test_dropped_messages_are_summarized_into_memory():
     for i in range(3):
         chat(conn, f"问{i}", f"答{i}")
     cfg = chat_history.settings(CONFIG)
-    rows, mem = chat_history.pending_summary("dev-1", cfg, CONFIG)
+    rows, mem = chat_history.pending_summary("dev-1", cfg)
     assert [r["content"] for r in rows] == ["我叫小明", "你好小明"] and mem["summary"] == ""
     assert {r["model"] for r in rows} == {"DeepSeekLLM"}
     llm = FakeLLM()
-    assert chat_history.summarize_now(llm, "dev-1", cfg, CONFIG)
+    assert chat_history.summarize_now(llm, "dev-1", cfg)
     prompt = llm.calls[0][1]
-    assert "用户：我叫小明" in prompt and "给我讲个故事吧" not in prompt  # 工具调用示例不会混进记忆
-    assert chat_history.memory_for(conn) == "- 用户叫小明，喜欢爬山"
+    assert "）：我叫小明" in prompt
+    assert re.search(r"用户（\d{4}-\d{2}-\d{2}）：", prompt)  # 用户的话前面带日期
+    assert chat_history.memory_for(conn) == AUTO + "- 用户叫小明，喜欢爬山"
     # 已总结过的不再总结
-    assert chat_history.pending_summary("dev-1", cfg, CONFIG)[0] == []
+    assert chat_history.pending_summary("dev-1", cfg)[0] == []
     # 增量：下一批带上已有记忆
     chat(conn, "问3", "答3")
     llm2 = FakeLLM("- 用户叫小明\n- 问过问0")
-    chat_history.summarize_now(llm2, "dev-1", cfg, CONFIG)
-    assert "【已有记忆】\n- 用户叫小明，喜欢爬山" in llm2.calls[0][1] and "用户：问0" in llm2.calls[0][1]
-    assert "用户：我叫小明" not in llm2.calls[0][1]
+    chat_history.summarize_now(llm2, "dev-1", cfg)
+    assert "【已有自动记忆】\n- 用户叫小明，喜欢爬山" in llm2.calls[0][1] and "）：问0" in llm2.calls[0][1]
+    assert "我叫小明" not in llm2.calls[0][1]
 
 
-@pytest.mark.parametrize("reply", ["【阿里百练API服务响应异常】", "【服务响应异常】", "  【服务响应异常】\n",
-                                   "我没听清，抱歉【服务响应异常】"])
-def test_error_reply_from_summary_model_keeps_old_memory(reply):
-    """AliBL、Dify 这类模型出错不抛异常、输出一句出错提示：不能拿它替换记忆，也不推进进度，下次重新总结。"""
+class FailingLLM:
+    def response_no_stream(self, system_prompt, user_prompt, **kwargs):
+        raise RuntimeError("Pi 引擎: 429 Too Many Requests")
+
+
+def test_summary_model_error_keeps_old_memory():
+    """总结用的模型出错（Pi 把接口的报错抛成异常）：不替换记忆，也不推进进度，下次重新总结。"""
     conn = make_conn()
     chat_history.load(conn, conn.dialogue, "DeepSeekLLM")
     chat(conn, "我叫小明", "你好小明")
@@ -240,11 +234,12 @@ def test_error_reply_from_summary_model_keeps_old_memory(reply):
         chat(conn, f"问{i}", f"答{i}")
     cfg = chat_history.settings(CONFIG)
     chat_history.db().set_memory("dev-1", "- 用户喜欢爬山", "summary")
-    assert not chat_history.summarize_now(FakeLLM(reply), "dev-1", cfg, CONFIG)
-    assert chat_history.memory_for(conn) == "- 用户喜欢爬山"
+    with pytest.raises(RuntimeError):
+        chat_history.summarize_now(FailingLLM(), "dev-1", cfg)
+    assert chat_history.memory_for(conn) == AUTO + "- 用户喜欢爬山"
     assert chat_history.db().progress("dev-1") == {}
-    assert chat_history.summarize_now(FakeLLM("- 用户叫小明\n- 【重要】喜欢爬山"), "dev-1", cfg, CONFIG)
-    assert chat_history.memory_for(conn) == "- 用户叫小明\n- 【重要】喜欢爬山"
+    assert chat_history.summarize_now(FakeLLM("- 用户叫小明\n- 【重要】喜欢爬山"), "dev-1", cfg)
+    assert chat_history.memory_for(conn) == AUTO + "- 用户叫小明\n- 【重要】喜欢爬山"
 
 
 def test_memory_goes_into_the_system_prompt():
@@ -277,18 +272,7 @@ def test_maybe_summarize_runs_in_background(monkeypatch):
             break
         import time
         time.sleep(0.02)
-    assert chat_history.memory_for(conn) == llm.reply and len(llm.calls) == 1
-
-
-def test_no_summary_for_agents(monkeypatch):
-    conn = make_conn()
-    chat_history.load(conn, conn.dialogue, "ClaudeCLI")
-    called = []
-    monkeypatch.setattr(chat_history, "_summary_llm", lambda *a: called.append(a))
-    for i in range(10):
-        chat(conn, f"问{i}", f"答{i}")
-    chat_history.maybe_summarize(conn)
-    assert called == []
+    assert chat_history.memory_for(conn) == AUTO + llm.reply and len(llm.calls) == 1
 
 
 # ---------- 显示 ----------
@@ -324,17 +308,11 @@ def test_clear_removes_records_memory_and_live_dialogues(project):
         chat(conn, f"问{i}", f"答{i}")
     chat(other, "别人的", "记录")
     chat_history.db().set_memory("dev-1", "记忆", "summary")
-    claude = SessionStore(project / "data" / "agent_sessions.json", "claude_cli")
-    claude.touch("dev-1", "sess-1")
-    agent = MagicMock()
-    conn.hub_route = {"used": [agent], "dialogues": {}}
 
-    result = chat_history.clear("dev-1", CONFIG, connections=[conn])
-    assert result == {"deleted": 8, "agents": []}
+    result = chat_history.clear("dev-1", connections=[conn])
+    assert result == {"deleted": 8}
     assert sent(conn) == [] and chat_history.memory_for(conn) == ""
-    assert [m.role for m in conn.dialogue.dialogue] == ["system", "user", "assistant"]  # 系统提示和示例留着
-    # 只清本机：Claude Code 的会话（映射、进程）不碰
-    assert agent.method_calls == [] and claude.get("dev-1")["session_id"] == "sess-1"
+    assert [m.role for m in conn.dialogue.dialogue] == ["system"]  # 系统提示留着
     assert chat_history.history("dev-2", 10)
     # 清除后接着聊照常存
     chat(conn, "新问题", "新回答")
@@ -349,27 +327,11 @@ def test_clear_memory_only_keeps_records_and_does_not_resummarize(project):
     for i in range(5):
         chat(conn, f"问{i}", f"答{i}")
     cfg = chat_history.settings(CONFIG)
-    chat_history.summarize_now(FakeLLM(), "dev-1", cfg, CONFIG)
-    chat_history.clear("dev-1", CONFIG, memory_only=True)
+    chat_history.summarize_now(FakeLLM(), "dev-1", cfg)
+    chat_history.clear("dev-1", memory_only=True)
     assert chat_history.memory_for(conn) == ""
-    assert chat_history.pending_summary("dev-1", cfg, CONFIG)[0] == []
+    assert chat_history.pending_summary("dev-1", cfg)[0] == []
     assert len(chat_history.history("dev-1", 100)["DeepSeekLLM"]) == 10
-
-
-def test_clear_leaves_agents_alone_and_names_them(project, monkeypatch):
-    """Claude Code、Grok Bot 有自己的上下文和记忆：清除只删本机存的记录，不调它们任何东西。"""
-    conn = make_conn()
-    chat_history.load(conn, conn.dialogue, "GrokBot_小助手")
-    chat(conn, "帮我查下", "好的")
-    cli = make_conn()
-    chat_history.load(cli, cli.dialogue, "ClaudeCLI")
-    chat(cli, "看看日志", "好的")
-    result = chat_history.clear("dev-1", CONFIG, connections=[conn, cli])
-    assert result == {"deleted": 4, "agents": ["Claude", "小助手"]}
-    assert chat_history.history("dev-1", 10) == {}
-    text = clear_command.result_text(result)
-    assert text.startswith(clear_command.DONE) and "Claude和小助手自己那边的对话没有动" in text
-    assert clear_command.result_text({"deleted": 2, "agents": []}) == clear_command.DONE
 
 
 # ---------- 语音指令 ----------
@@ -410,7 +372,7 @@ def spoken(monkeypatch):
 
     async def fake_clear(conn):
         said.append("<clear>")
-        return {"deleted": 3, "agents": []}
+        return {"deleted": 3}
 
     async def fake_notify(conn):
         said.append("<notify>")
@@ -479,22 +441,18 @@ def make_handler(llm, device="dev-1"):
     h.intent_type = "nointent"
     h.config = CONFIG
     h.current_speaker = None
-    h.system_introduced_speakers = set()
     h.features = {"emoji": False}
     h.client_abort = False
     h.sentence_id = None
     h.session_id = f"s-{device}"
     h.device_id = device
+    h.stop_event = threading.Event()
     chat_history.load(h, h.dialogue, "DeepSeekLLM")
     return h
 
 
-class EchoLLM:
-    def __init__(self):
-        self.seen = []
-
-    def response(self, session_id, dialogue, **kw):
-        self.seen.append(dialogue)
+class EchoLLM(FakePi):
+    def answer(self, dialogue):
         yield f"收到：{dialogue[-1]['content']}"
 
 
@@ -507,7 +465,7 @@ def test_handler_saves_each_turn_and_next_connection_remembers(monkeypatch):
     llm = EchoLLM()
     h2 = make_handler(llm)
     h2.chat("我刚才说了什么")
-    sent_now = [(m["role"], m["content"]) for m in llm.seen[0][1:]]
+    sent_now = [(m["role"], m["content"]) for m in llm.asked[0][1:]]
     assert sent_now == [("user", "我叫小明"), ("assistant", "收到：我叫小明"), ("user", "我喜欢爬山"),
                         ("assistant", "收到：我喜欢爬山"), ("user", "我刚才说了什么")]
     assert len(chat_history.db().recent("dev-1", "DeepSeekLLM", 100)) == 6
@@ -518,7 +476,7 @@ def test_handler_puts_summary_memory_in_system_prompt():
     llm = EchoLLM()
     h = make_handler(llm)
     h.chat("你好")
-    assert "- 用户叫小明" in llm.seen[0][0]["content"]
+    assert "- 用户叫小明" in llm.asked[0][0]["content"]
 
 
 def test_notify_cleared_message():
@@ -543,50 +501,47 @@ def test_summary_finished_after_a_clear_is_dropped(project):
 
     class ClearingLLM(FakeLLM):
         def response_no_stream(self, system_prompt, user_prompt, **kwargs):
-            chat_history.clear("dev-1", CONFIG)   # 总结期间用户清除了，又接着聊
+            chat_history.clear("dev-1")   # 总结期间用户清除了，又接着聊
             for i in range(5):
                 chat(conn, f"新{i}", f"新答{i}")
             return "- 旧记忆"
 
-    assert not chat_history.summarize_now(ClearingLLM(), "dev-1", cfg, CONFIG)
+    assert not chat_history.summarize_now(ClearingLLM(), "dev-1", cfg)
     assert chat_history.memory_for(conn) == ""
 
 
 # ---------- 记忆按设备共用 ----------
 
-def test_memory_is_shared_by_api_models_of_a_device_but_not_agents():
+def test_memory_is_shared_by_the_models_of_a_device():
     chat_history.db().set_memory("dev-1", "- 用户叫小明", "summary")
-    for name, expect in (("DeepSeekLLM", "- 用户叫小明"), ("ClaudeAPI", "- 用户叫小明"), ("ClaudeCLI", ""),
-                         ("GrokBot_小助手", "")):
+    for name in ("DeepSeekLLM", "ClaudeAPI"):
         conn = make_conn()
         chat_history.load(conn, conn.dialogue, name)
-        assert chat_history.memory_for(conn) == expect, name
+        assert chat_history.memory_for(conn) == AUTO + "- 用户叫小明", name
     other = make_conn("dev-2")
     chat_history.load(other, other.dialogue, "DeepSeekLLM")
     assert chat_history.memory_for(other) == ""
 
 
-def test_one_summary_covers_every_api_model_with_progress_per_model():
-    a, b, cli = make_conn(), make_conn(), make_conn()
+def test_one_summary_covers_every_model_with_progress_per_model():
+    a, b = make_conn(), make_conn()
     chat_history.load(a, a.dialogue, "DeepSeekLLM")
     chat_history.load(b, b.dialogue, "ClaudeAPI")
-    chat_history.load(cli, cli.dialogue, "ClaudeCLI")
     for i in range(4):
         chat(a, f"深{i}", f"深答{i}")
         chat(b, f"克{i}", f"克答{i}")
-        chat(cli, f"命{i}", f"命答{i}")
     cfg = chat_history.settings(CONFIG)
-    rows, _ = chat_history.pending_summary("dev-1", cfg, CONFIG)
-    assert [r["content"] for r in rows] == ["克0", "克答0", "深0", "深答0"]   # Claude Code 的不总结
+    rows, _ = chat_history.pending_summary("dev-1", cfg)
+    assert [r["content"] for r in rows] == ["克0", "克答0", "深0", "深答0"]
     llm = FakeLLM()
-    assert chat_history.summarize_now(llm, "dev-1", cfg, CONFIG)
+    assert chat_history.summarize_now(llm, "dev-1", cfg)
     assert "（和 ClaudeAPI 的对话）" in llm.calls[0][1] and "（和 DeepSeekLLM 的对话）" in llm.calls[0][1]
     progress = chat_history.db().progress("dev-1")
     assert set(progress) == {"ClaudeAPI", "DeepSeekLLM"}
-    assert chat_history.pending_summary("dev-1", cfg, CONFIG)[0] == []
+    assert chat_history.pending_summary("dev-1", cfg)[0] == []
     # 只有一个模型又截掉了新的：只总结它的
     chat(a, "深4", "深答4")
-    assert [r["content"] for r in chat_history.pending_summary("dev-1", cfg, CONFIG)[0]] == ["深1", "深答1"]
+    assert [r["content"] for r in chat_history.pending_summary("dev-1", cfg)[0]] == ["深1", "深答1"]
 
 
 def test_summary_is_dropped_if_memory_was_edited_meanwhile():
@@ -602,13 +557,13 @@ def test_summary_is_dropped_if_memory_was_edited_meanwhile():
             assert ok
             return "- 自动总结的"
 
-    assert not chat_history.summarize_now(EditedMeanwhile(), "dev-1", cfg, CONFIG)
+    assert not chat_history.summarize_now(EditedMeanwhile(), "dev-1", cfg)
     mem = chat_history.db().memory("dev-1")
-    assert mem["summary"] == "- 后台改的" and mem["source"] == "manual"
+    assert mem["pinned"] == "- 后台改的" and mem["summary"] == "" and mem["source"] == "manual"  # 后台默认改手动保留的那份
     # 进度没动：下次在手改的基础上再总结这批
     llm = FakeLLM("- 合并后的")
-    assert chat_history.summarize_now(llm, "dev-1", cfg, CONFIG)
-    assert "【已有记忆】\n- 后台改的" in llm.calls[0][1]
+    assert chat_history.summarize_now(llm, "dev-1", cfg)
+    assert "【手动保留】\n- 后台改的" in llm.calls[0][1]
 
 
 def test_concurrent_summaries_of_one_device_run_one_at_a_time(monkeypatch):
@@ -639,19 +594,19 @@ def test_concurrent_summaries_of_one_device_run_one_at_a_time(monkeypatch):
     deadline = _time.monotonic() + 2
     while chat_history._summarizing and _time.monotonic() < deadline:
         _time.sleep(0.01)
-    assert len(calls) == 1 and chat_history.memory_for(a) == "- 记忆"
+    assert len(calls) == 1 and chat_history.memory_for(a) == AUTO + "- 记忆"
 
 
 def test_set_memory_from_admin_takes_effect_and_checks_version():
     conn = make_conn()
     chat_history.load(conn, conn.dialogue, "DeepSeekLLM")
-    ok, mem = chat_history.set_memory("dev-1", "  - 用户叫小红  ")
-    assert ok and mem["summary"] == "- 用户叫小红" and mem["source"] == "manual" and mem["version"] == 1
+    ok, mem = chat_history.set_memory("dev-1", "  - 用户叫小红  ")  # 不指定时改手动保留的那份
+    assert ok and mem["pinned"] == "- 用户叫小红" and mem["source"] == "manual" and mem["version"] == 1
     assert "- 用户叫小红" in conn.dialogue.get_llm_dialogue_with_memory(chat_history.memory_for(conn))[0]["content"]
     ok, mem = chat_history.set_memory("dev-1", "旧版本上改的", expect_version=0)
-    assert not ok and mem["summary"] == "- 用户叫小红"
+    assert not ok and mem["pinned"] == "- 用户叫小红"
     ok, mem = chat_history.set_memory("dev-1", "", expect_version=1)
-    assert ok and mem["summary"] == "" and mem["source"] == "cleared"
+    assert ok and mem["pinned"] == "" and mem["source"] == "cleared"
 
 
 def test_old_per_model_memories_are_merged(tmp_path):
@@ -677,9 +632,9 @@ def test_old_per_model_memories_are_merged(tmp_path):
     chat_history.ChatDB(path).close()   # 再打开一次不出错
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows 没有 POSIX 权限位")
 def test_db_files_are_private(tmp_path):
     """聊天记录库和 -wal、-shm 只给自己读写（同目录的 .config.yaml 也是 600），以前建成 644 的也改过来。"""
-    import os
     import stat
 
     path = tmp_path / "chat.db"
@@ -706,6 +661,6 @@ def test_clear_bumps_memory_version_so_running_summary_is_dropped(project):
     chat_history.load(conn, conn.dialogue, "DeepSeekLLM")
     chat_history.db().set_memory("dev-1", "- 记忆", "summary")
     before = chat_history.db().memory("dev-1")["version"]
-    chat_history.clear("dev-1", CONFIG)
+    chat_history.clear("dev-1")
     mem = chat_history.db().memory("dev-1")
     assert mem["summary"] == "" and mem["version"] == before + 1 and chat_history.db().progress("dev-1") == {}

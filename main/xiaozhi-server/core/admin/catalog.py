@@ -1,78 +1,20 @@
-"""管理后台用到的固定清单：大模型厂商预设、语音识别选项、EdgeTTS 中文音色、插件说明、Claude CLI 选项。"""
+"""管理后台用到的固定清单：大模型厂商、语音识别选项、EdgeTTS 中文音色、插件说明。"""
 
-# ---------- 大模型：API 厂商（统一走 OpenAI 兼容协议） ----------
-# entry：保存到配置里的条目名。已有的上游条目直接复用（保留用户填过的 Key），其余是新条目。
-# models：模型名的候选，第一个是默认值；页面上仍可手填其他模型。
+# ---------- 大模型：API 厂商 ----------
+# 配置里这几个条目名是 API 厂商的：后台和设备上显示 label；设备按 id 选厂商图标，呼名预填 id 当称呼。
 LLM_VENDORS = [
-    {"id": "claude", "label": "Claude", "entry": "ClaudeAPI",
-     "base_url": "https://api.anthropic.com/v1/",
-     "models": ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"]},
-    {"id": "openai", "label": "OpenAI", "entry": "OpenAILLM",
-     "base_url": "https://api.openai.com/v1",
-     "models": ["gpt-5-mini", "gpt-5"]},
-    {"id": "gemini", "label": "Gemini", "entry": "GeminiAPI",
-     "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-     "models": ["gemini-2.5-flash", "gemini-2.5-pro"]},
-    {"id": "deepseek", "label": "DeepSeek", "entry": "DeepSeekLLM",
-     "base_url": "https://api.deepseek.com",
-     "models": ["deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"]},
-    {"id": "qwen", "label": "通义千问", "entry": "AliLLM",
-     "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-     "models": ["qwen-flash", "qwen-plus", "qwen-max"]},
-    {"id": "doubao", "label": "豆包", "entry": "DoubaoLLM",
-     "base_url": "https://ark.cn-beijing.volces.com/api/v3",
-     "models": ["doubao-seed-2-0-lite-260215"]},
-    {"id": "glm", "label": "智谱 GLM", "entry": "ChatGLMLLM",
-     "base_url": "https://open.bigmodel.cn/api/paas/v4/",
-     "models": ["glm-4-flash", "glm-4-plus"]},
-    {"id": "kimi", "label": "Kimi", "entry": "KimiLLM",
-     "base_url": "https://api.moonshot.cn/v1",
-     "models": ["kimi-latest", "moonshot-v1-8k"]},
-    {"id": "custom", "label": "自定义", "entry": "CustomOpenAILLM",
-     "base_url": "", "models": [],
-     "hint": "其他 OpenAI 兼容服务，例如本机代理、LM Studio（http://localhost:1234/v1）、Ollama（http://localhost:11434/v1）"},
+    {"id": "claude", "label": "Claude", "entry": "ClaudeAPI"},
+    {"id": "openai", "label": "OpenAI", "entry": "OpenAILLM"},
+    {"id": "gemini", "label": "Gemini", "entry": "GeminiAPI"},
+    {"id": "deepseek", "label": "DeepSeek", "entry": "DeepSeekLLM"},
+    {"id": "qwen", "label": "通义千问", "entry": "AliLLM"},
+    {"id": "doubao", "label": "豆包", "entry": "DoubaoLLM"},
+    {"id": "glm", "label": "智谱 GLM", "entry": "ChatGLMLLM"},
+    {"id": "kimi", "label": "Kimi", "entry": "KimiLLM"},
+    {"id": "custom", "label": "自定义", "entry": "CustomOpenAILLM"},
 ]
 VENDOR_BY_ID = {v["id"]: v for v in LLM_VENDORS}
 VENDOR_BY_ENTRY = {v["entry"]: v for v in LLM_VENDORS}
-
-# ---------- 大模型：Claude Code CLI ----------
-CLAUDE_MODELS = [
-    {"value": "haiku", "label": "Haiku", "hint": "最快，适合语音"},
-    {"value": "sonnet", "label": "Sonnet", "hint": "更聪明"},
-    {"value": "opus", "label": "Opus", "hint": "很强，较慢"},
-    {"value": "fable", "label": "Fable", "hint": "最强，最慢"},
-]
-CLAUDE_EFFORTS = [
-    {"value": "low", "label": "低"},
-    {"value": "medium", "label": "中"},
-    {"value": "high", "label": "高"},
-    {"value": "xhigh", "label": "超高", "slow": True},
-    {"value": "max", "label": "最高", "slow": True},
-]
-# 权限级别：决定开放哪些工具，以及 Claude Code 的权限模式
-CLAUDE_READ_TOOLS = ["Read", "Grep", "Glob"]
-CLAUDE_WEB_TOOLS = ["WebSearch", "WebFetch"]
-CLAUDE_LEVELS = [
-    {"value": "read", "label": "只读", "mode": "default", "tools": CLAUDE_READ_TOOLS,
-     "desc": "只能查看、搜索工作目录里的文件"},
-    {"value": "edit", "label": "可编辑", "mode": "acceptEdits", "tools": CLAUDE_READ_TOOLS + ["Write", "Edit"],
-     "desc": "还能在工作目录里新建、修改文件，自动通过"},
-    {"value": "auto", "label": "Auto", "mode": "auto",
-     "tools": CLAUDE_READ_TOOLS + ["Write", "Edit", "Bash", "TodoWrite"],
-     "desc": "还能执行命令等，由 Claude Code 自己判断：低风险的自动放行，需要确认的一律不执行"},
-]
-CLAUDE_LEVEL_BY_VALUE = {lv["value"]: lv for lv in CLAUDE_LEVELS}
-CLAUDE_TOOLS = [
-    {"name": "Read", "label": "读文件", "risky": False},
-    {"name": "Grep", "label": "搜内容", "risky": False},
-    {"name": "Glob", "label": "找文件", "risky": False},
-    {"name": "WebSearch", "label": "联网搜索", "risky": False},
-    {"name": "WebFetch", "label": "打开网页", "risky": False},
-    {"name": "Bash", "label": "执行命令", "risky": True},
-    {"name": "Write", "label": "写文件", "risky": True},
-    {"name": "Edit", "label": "改文件", "risky": True},
-    {"name": "TodoWrite", "label": "记待办", "risky": False},
-]
 
 # ---------- 语音识别：后台可以选的两种 ----------
 # 本地只开放默认的 X-ASR（安装脚本已下载）；其他本地模型选中时会自动下载，不放进后台

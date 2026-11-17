@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 from core.connection import ConnectionHandler
 from core.utils import reply_progress
 from core.utils.dialogue import Dialogue, Message
+from tests.fake_pi import FakePi
 
 PKT = b"x"  # 一个 60ms 的 Opus 包
 
@@ -94,16 +95,6 @@ def test_cut_while_thinking_drops_the_unanswered_question():
     reply_progress.finish_turn(conn, "t1")
     start_turn(conn, "t2", "算了，换个问题")
     assert contents(conn) == [("user", "算了，换个问题")]
-
-
-def test_cut_while_an_agent_thinks_keeps_the_question():
-    # Claude Code / Grok Bot 被打断后还会在后台接着做，做完进待汇报：提问要留着
-    conn = make_conn()
-    conn.llm = SimpleNamespace(AGENT_LABEL="Claude Code")
-    start_turn(conn, "t1", "帮我看看这个仓库")
-    reply_progress.cut(conn, played_ms=0)
-    reply_progress.finish_turn(conn, "t1")
-    assert contents(conn) == [("user", "帮我看看这个仓库"), ("assistant", "……")]
 
 
 def test_cut_while_thinking_keeps_a_turn_that_already_ran_tools():
@@ -200,11 +191,11 @@ def make_handler(llm):
     h.intent_type = "nointent"
     h.config = {}
     h.current_speaker = None
-    h.system_introduced_speakers = set()
     h.features = {"emoji": False}
     h.client_abort = False
     h.sentence_id = None
     h.session_id = "s"
+    h.stop_event = threading.Event()
     return h
 
 
@@ -212,8 +203,8 @@ def test_superseded_turn_stops_and_does_not_store_its_reply():
     first_chunk = threading.Event()
     go_on = threading.Event()
 
-    class SlowLLM:
-        def response(self, session_id, dialogue, **kw):
+    class SlowLLM(FakePi):
+        def answer(self, dialogue):
             if dialogue[-1]["content"] == "第一个问题":
                 yield "第一段，"
                 first_chunk.set()

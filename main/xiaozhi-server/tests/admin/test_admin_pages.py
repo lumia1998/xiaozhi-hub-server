@@ -10,22 +10,14 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from core.admin import catalog, config_store, connections, pages
 from core.admin import admin_handler as ah
-from core.agent import llm_router, reports
+from core.agent import llm_router
 from core.providers.asr import doubao_stream
 
 CUSTOM_YAML = """\
 selected_module:
-  LLM: ClaudeCLI
+  LLM: ClaudeAPI
   Intent: nointent
 LLM:
-  ClaudeCLI:
-    type: claude_cli
-    model: haiku
-    effort: low
-    workdir: ~/xiaozhi-workspace
-    allowed_tools: [Read, Grep, Glob]
-    permission_mode: default
-    turn_timeout_seconds: 120
   ClaudeAPI:
     type: openai
     base_url: https://api.anthropic.com/v1/
@@ -47,116 +39,38 @@ def merged(path):
 
 # ---------- 大模型 ----------
 
-def test_describe_llm_kinds_and_vendors(cfg_path):
-    d = pages.describe_llm(merged(cfg_path))
-    assert d["kind"] == "cli" and d["vendor"] is None
-    vendors = {v["id"]: v for v in d["vendors"]}
-    assert [v["id"] for v in catalog.LLM_VENDORS] == list(vendors)
-    assert vendors["claude"]["configured"] is False  # 占位 Key 不算配置好
-    assert vendors["openai"]["base_url"] == "https://api.openai.com/v1" and vendors["openai"]["configured"] is False
-    assert vendors["deepseek"]["base_url"] == "https://api.deepseek.com"  # 上游条目用的是 url 字段
-    assert d["claude"]["values"]["allowed_tools"] == ["Read", "Grep", "Glob"]
-    assert pages.llm_kind(merged(cfg_path), "OllamaLLM") == "other"
+KEY = "sk-" + "test" * 5
 
 
-def test_save_vendor_creates_new_entry_and_masks_key(cfg_path):
-    changed = pages.save_vendor("kimi", {"base_url": "https://api.moonshot.cn/v1", "model": "kimi-latest",
-                                         "api_key": "sk-kimi-1234567890"}, merged(cfg_path), cfg_path)
-    assert set(changed) == {"base_url", "model_name", "api_key"}
-    entry = merged(cfg_path)["LLM"]["KimiLLM"]
-    assert entry["type"] == "openai" and entry["api_key"] == "sk-kimi-1234567890"
-    v = pages.describe_vendor(catalog.VENDOR_BY_ID["kimi"], merged(cfg_path))
-    assert v["configured"] and v["key_hint"] == "sk-k…7890" and "sk-kimi-1234567890" not in str(v)
-    # 再保存一次、Key 留空：不修改
-    assert pages.save_vendor("kimi", {"base_url": "https://api.moonshot.cn/v1", "model": "kimi-latest", "api_key": ""},
-                             merged(cfg_path), cfg_path) == []
+def _configure(path, entry, **fields):
+    with config_store.edit_custom(path) as data:
+        data["LLM"].setdefault(entry, {}).update(fields)
 
 
-def test_save_vendor_keeps_upstream_url_field(cfg_path):
-    pages.save_vendor("deepseek", {"base_url": "https://api.deepseek.com/v1", "model": "deepseek-chat",
-                                   "api_key": "sk-ds-1234567890"}, merged(cfg_path), cfg_path)
-    custom = config_store.load_custom(cfg_path)["LLM"]["DeepSeekLLM"]
-    assert custom["url"] == "https://api.deepseek.com/v1" and "base_url" not in custom and "type" not in custom
+def _configure_deepseek(path):
+    _configure(path, "DeepSeekLLM", model_name="deepseek-chat", api_key=KEY)
 
 
-@pytest.mark.parametrize("payload, message", [
-    ({"base_url": "ftp://x", "model": "m"}, "http"),
-    ({"base_url": "https://x/v1", "model": ""}, "模型"),
-    ({"base_url": "https://x/v1", "model": "m", "api_key": "sk bad"}, "空格"),
-])
-def test_save_vendor_validation(cfg_path, payload, message):
-    with pytest.raises(ValueError, match=message):
-        pages.save_vendor("openai", payload, merged(cfg_path), cfg_path)
-    with pytest.raises(KeyError):
-        pages.save_vendor("nope", payload, merged(cfg_path), cfg_path)
+def _migrate_to_pi(path, entry, **fields):
+    """ops 的迁移 0001 改过的厂商条目：type 从 openai 改成 pi，加 protocol: chat。"""
+    _configure(path, entry, type="pi", protocol="chat", api_key=KEY, **fields)
 
 
-def test_save_claude_cli_validates_choices(cfg_path):
-    with pytest.raises(ValueError, match="思考力度"):
-        pages.save_claude_cli({"effort": "superhigh"}, merged(cfg_path), cfg_path)
-    with pytest.raises(ValueError, match="权限模式"):
-        pages.save_claude_cli({"permission_mode": "whatever"}, merged(cfg_path), cfg_path)
-    with pytest.raises(ValueError, match="工具名"):
-        pages.save_claude_cli({"allowed_tools": ["Read", "rm -rf"]}, merged(cfg_path), cfg_path)
-    with pytest.raises(ValueError, match="工作目录"):
-        pages.save_claude_cli({"workdir": " "}, merged(cfg_path), cfg_path)
-    with pytest.raises(ValueError, match="0 或正数"):
-        pages.save_claude_cli({"turn_timeout_seconds": "-1"}, merged(cfg_path), cfg_path)
-    with pytest.raises(ValueError, match="大于 0"):
-        pages.save_claude_cli({"filler_delay_seconds": "0"}, merged(cfg_path), cfg_path)
-    # 超时、空闲关闭、自动接续填 0 有特别含义（不限制 / 每轮关闭 / 不自动接续），要能保存
-    assert pages.save_claude_cli({"turn_timeout_seconds": "0"}, merged(cfg_path), cfg_path) == ["turn_timeout_seconds"]
-    assert merged(cfg_path)["LLM"]["ClaudeCLI"]["turn_timeout_seconds"] == 0
-    changed = pages.save_claude_cli({"effort": "medium", "allowed_tools": ["Read", "WebSearch"], "model": "sonnet"},
-                                    merged(cfg_path), cfg_path)
-    entry = merged(cfg_path)["LLM"]["ClaudeCLI"]
-    assert set(changed) == {"effort", "allowed_tools", "model"}
-    assert entry["effort"] == "medium" and entry["allowed_tools"] == ["Read", "WebSearch"]
-
-
-def test_claude_levels_and_web_switch(cfg_path):
-    d = pages.describe_claude_cli(merged(cfg_path))
-    assert d["level"] == "read" and d["web"] is False
-    assert [o["value"] for o in d["options"]["model"]] == ["haiku", "sonnet", "opus", "fable"]
-    assert [o["value"] for o in d["options"]["effort"]] == ["low", "medium", "high", "xhigh", "max"]
-    pages.save_claude_cli({"level": "edit", "web": True, "effort": "xhigh"}, merged(cfg_path), cfg_path)
-    e = merged(cfg_path)["LLM"]["ClaudeCLI"]
-    assert e["permission_mode"] == "acceptEdits" and e["effort"] == "xhigh"
-    assert e["allowed_tools"] == ["Read", "Grep", "Glob", "Write", "Edit", "WebSearch", "WebFetch"]
-    d = pages.describe_claude_cli(merged(cfg_path))
-    assert d["level"] == "edit" and d["web"] is True
-    pages.save_claude_cli({"level": "auto", "web": False}, merged(cfg_path), cfg_path)
-    e = merged(cfg_path)["LLM"]["ClaudeCLI"]
-    assert e["permission_mode"] == "auto" and "Bash" in e["allowed_tools"] and "WebSearch" not in e["allowed_tools"]
-    with pytest.raises(ValueError, match="权限级别"):
-        pages.save_claude_cli({"level": "root"}, merged(cfg_path), cfg_path)
-
-
-def test_claude_custom_level_keeps_tools(cfg_path):
-    cfg_path.write_text(CUSTOM_YAML.replace("allowed_tools: [Read, Grep, Glob]", "allowed_tools: [Read, Bash]"), encoding="utf-8")
-    assert pages.describe_claude_cli(merged(cfg_path))["level"] == "custom"
-    pages.save_claude_cli({"level": "custom", "web": True}, merged(cfg_path), cfg_path)
-    e = merged(cfg_path)["LLM"]["ClaudeCLI"]
-    assert e["allowed_tools"] == ["Read", "Bash", "WebSearch", "WebFetch"] and e["permission_mode"] == "default"
-
-
-def test_vendor_test_config_prefers_unsaved_values(cfg_path):
-    with pytest.raises(ValueError, match="API Key"):
-        pages.vendor_test_config("claude", {}, merged(cfg_path))
-    cfg = pages.vendor_test_config("claude", {"api_key": "sk-new-123", "model": "claude-sonnet-5-5"}, merged(cfg_path))
-    assert cfg["api_key"] == "sk-new-123" and cfg["model_name"] == "claude-sonnet-5-5"
-    assert cfg["base_url"] == "https://api.anthropic.com/v1/" and cfg["type"] == "openai"
-    assert pages.vendor_test_config("custom", {"base_url": "http://127.0.0.1:1234/v1", "model": "m"},
-                                    merged(cfg_path))["api_key"] == "not-needed"
-
-
-def test_desired_intent(cfg_path):
-    m = merged(cfg_path)
-    assert pages.desired_intent(m, "ClaudeCLI", cfg_path) == "nointent"
-    assert pages.desired_intent(m, "ClaudeAPI", cfg_path) == "function_call"  # 所有 API 模型都能用插件
-    assert pages.desired_intent(m, "DeepSeekLLM", cfg_path) == "function_call"
-    pages.remember_api_intent("nointent", cfg_path)
-    assert pages.desired_intent(m, "DeepSeekLLM", cfg_path) == "nointent"
+def test_model_choices(cfg_path):
+    """能切过去的模型：填好了的厂商条目按 LLM_VENDORS 的顺序在前，模型服务的模型在后。"""
+    assert pages.model_choices(merged(cfg_path)) == []  # ClaudeAPI 还是占位 Key
+    _configure_deepseek(cfg_path)  # 上游条目：type openai，接口地址在 url 字段
+    _migrate_to_pi(cfg_path, "KimiLLM", base_url="https://api.moonshot.cn/v1", model_name="kimi-latest")
+    with config_store.edit_custom(cfg_path) as data:
+        data["model_services"] = {"lan": {"name": "局域网", "base_url": "http://192.168.1.5:1234/v1", "api_key": ""}}
+        data["LLM"]["Service_lan_qwen"] = {"type": "pi", "service_id": "lan", "model_name": "qwen3-8b"}
+    choices = pages.model_choices(merged(cfg_path))
+    assert choices == [
+        {"entry": "DeepSeekLLM", "vendor": "deepseek", "label": "DeepSeek", "model": "deepseek-chat"},
+        {"entry": "KimiLLM", "vendor": "kimi", "label": "Kimi", "model": "kimi-latest"},  # type: pi 的厂商条目只列一次
+        {"entry": "Service_lan_qwen", "vendor": "custom", "label": "qwen3-8b", "model": "qwen3-8b"},
+    ]
+    assert KEY not in str(choices)  # /kiosk/llm 不用登录
 
 
 # ---------- 语音识别、语音合成、意图识别 ----------
@@ -204,7 +118,7 @@ def test_intent_plugins_keep_manual_extras(cfg_path):
     functions: [get_weather, my_custom_plugin]
 """, encoding="utf-8")
     d = pages.describe_intent(merged(cfg_path))
-    assert d["locked"] is True and d["mode"] == "nointent" and d["extra"] == ["my_custom_plugin"]
+    assert d["mode"] == "nointent" and d["extra"] == ["my_custom_plugin"]
     assert next(p for p in d["plugins"] if p["name"] == "web_search")["needs_config"] is True  # 上游默认 Key 是 mk-xxx
     with pytest.raises(ValueError):
         pages.save_intent_plugins(["evil"], merged(cfg_path), cfg_path)
@@ -217,7 +131,7 @@ def test_intent_plugins_keep_manual_extras(cfg_path):
 @pytest.fixture
 async def client(cfg_path):
     app = web.Application()
-    config = {"selected_module": {"LLM": "ClaudeCLI", "Intent": "nointent"}, "LLM": {}, "Intent": {}}
+    config = {"selected_module": {"LLM": "ClaudeAPI", "Intent": "nointent"}, "LLM": {}, "Intent": {}}
     handler = ah.AdminHandler(config, ws_server=None, config_path=cfg_path)
     handler.register(app)
     async with TestClient(TestServer(app)) as c:
@@ -232,58 +146,14 @@ async def test_switch_failure_restores_selection(cfg_path, monkeypatch):
         raise RuntimeError("load failed.")
     monkeypatch.setattr(ah, "initialize_modules", boom)
     ws = SimpleNamespace(config_lock=asyncio.Lock(), _llm="old-llm")
-    running = {"selected_module": {"LLM": "ClaudeCLI"}, "LLM": {}}
+    running = {"selected_module": {"LLM": "ClaudeAPI"}, "LLM": {}}
     h = ah.AdminHandler(running, ws_server=ws, config_path=cfg_path)
     result = await h._switch("LLM", "ChatGLMLLM")
-    assert result["ok"] is False and "已恢复为原来的 ClaudeCLI" in result["note"] and "。。" not in result["note"]
-    assert merged(cfg_path)["selected_module"]["LLM"] == "ClaudeCLI" and ws._llm == "old-llm"
+    assert result["ok"] is False and "已恢复为原来的 ClaudeAPI" in result["note"] and "。。" not in result["note"]
+    assert merged(cfg_path)["selected_module"]["LLM"] == "ClaudeAPI" and ws._llm == "old-llm"
 
 
-async def test_llm_use_links_intent(client, cfg_path):
-    r = await client.post("/admin/api/llm/use", json={"kind": "api", "vendor": "deepseek"})
-    assert r.status == 400 and "还没配置好" in (await r.json())["error"]
-    r = await client.post("/admin/api/llm/vendors/deepseek",
-                          json={"base_url": "https://api.deepseek.com", "model": "deepseek-chat", "api_key": "sk-ds-123456789"})
-    assert r.status == 200
-    r = await client.post("/admin/api/llm/use", json={"kind": "api", "vendor": "deepseek"})
-    data = await r.json()
-    assert r.status == 200 and "用插件" in data["note"]
-    m = merged(cfg_path)["selected_module"]
-    assert m["LLM"] == "DeepSeekLLM" and m["Intent"] == "function_call"
-    # 回到 Claude CLI：意图识别自动改回 nointent；API 模式下不能选插件的限制随之生效
-    r = await client.post("/admin/api/llm/use", json={"kind": "cli"})
-    assert r.status == 200 and merged(cfg_path)["selected_module"]["Intent"] == "nointent"
-    r = await client.post("/admin/api/intent", json={"mode": "function_call", "functions": []})
-    assert r.status == 400
-
-
-async def test_saving_non_default_model_updates_running_config(client):
-    """后台保存不是默认的模型后，运行中的配置要跟着更新：呼名切模型照它判断是否配好、创建实例，不用重启。"""
-    assert "DeepSeekLLM" not in client.handler.config["LLM"]
-    r = await client.post("/admin/api/llm/vendors/deepseek",
-                          json={"base_url": "https://api.deepseek.com", "model": "deepseek-chat", "api_key": "sk-ds-123456789"})
-    assert r.status == 200 and (await r.json())["note"] == "已保存"
-    running = client.handler.config
-    assert running["selected_module"]["LLM"] == "ClaudeCLI"  # 默认模型不变
-    assert running["LLM"]["DeepSeekLLM"]["model_name"] == "deepseek-chat"
-    assert llm_router.model_ready(running, "DeepSeekLLM")
-    await client.post("/admin/api/llm/vendors/deepseek", json={"base_url": "https://api.deepseek.com", "model": "deepseek-reasoner"})
-    assert running["LLM"]["DeepSeekLLM"]["model_name"] == "deepseek-reasoner"
-    # Claude Code 不是默认时改它的设置（例如把权限从 Auto 调回只读），呼名切过去也要用上新设置
-    assert (await client.post("/admin/api/llm/use", json={"kind": "api", "vendor": "deepseek"})).status == 200
-    assert running["selected_module"]["LLM"] == "DeepSeekLLM"
-    r = await client.post("/admin/api/llm/claude", json={"level": "auto"})
-    assert r.status == 200 and running["LLM"]["ClaudeCLI"]["permission_mode"] == "auto"
-    r = await client.post("/admin/api/llm/claude", json={"level": "read"})
-    assert r.status == 200 and running["LLM"]["ClaudeCLI"]["permission_mode"] == "default"
-    assert "Bash" not in running["LLM"]["ClaudeCLI"]["allowed_tools"]
-
-
-async def test_llm_and_page_endpoints(client):
-    data = await (await client.get("/admin/api/llm")).json()
-    assert data["kind"] == "cli" and "install" in data["claude"]
-    r = await client.post("/admin/api/llm/claude", json={"effort": "nope"})
-    assert r.status == 400 and "思考力度" in (await r.json())["error"]
+async def test_page_endpoints(client):
     assert (await client.get("/admin/api/asr")).status == 200
     tts = await (await client.get("/admin/api/tts")).json()
     assert len(tts["voices"]) == 14
@@ -291,8 +161,8 @@ async def test_llm_and_page_endpoints(client):
     r = await client.post("/admin/api/tts", json={"voice": "zh-CN-YunxiNeural"})
     assert r.status == 200 and (await r.json())["changed"] == ["voice"]
     intent = await (await client.get("/admin/api/intent")).json()
-    assert intent["locked"] is True
-    for path in ("llm", "asr", "tts", "intent"):
+    assert intent["mode"] == "nointent"
+    for path in ("model-services", "asr", "tts", "intent"):
         await client.post("/admin/api/logout", json={})
         assert (await client.get(f"/admin/api/{path}")).status == 401
         await client.post("/admin/api/login", json={"password": "pass-1234"})
@@ -302,41 +172,36 @@ async def test_llm_and_page_endpoints(client):
 
 @pytest.fixture
 def kiosk(client, tmp_path, monkeypatch):
-    """不登录也能用；Claude Code 当作已安装；设备记住的模型写到临时文件。"""
+    """不登录也能用；设备记住的模型写到临时文件。"""
     from core.agent.session_store import SessionStore
 
     monkeypatch.setattr(llm_router, "_store", SessionStore(tmp_path / "agent_sessions.json", "last_model"))
-    monkeypatch.setattr(ah.AdminHandler, "_claude_install", lambda self, merged, version=True: {"installed": True})
     return client
 
 
-async def test_kiosk_llm_list_and_device_model(kiosk):
-    r = await kiosk.post("/admin/api/llm/vendors/deepseek",
-                         json={"base_url": "https://api.deepseek.com", "model": "deepseek-chat", "api_key": "sk-ds-123456789"})
-    assert r.status == 200
+async def test_kiosk_llm_list_and_device_model(kiosk, cfg_path):
+    _configure_deepseek(cfg_path)
     await kiosk.post("/admin/api/logout", json={})
     data = await (await kiosk.get("/kiosk/llm")).json()
-    assert data["ok"] and data["selected"] == data["default"] == "ClaudeCLI" and data["kind"] == "cli"
-    assert [(o["kind"], o["vendor"], o["entry"]) for o in data["options"]] == \
-        [("cli", "claude-code", "ClaudeCLI"), ("api", "deepseek", "DeepSeekLLM")]  # 没配好的厂商不列
-    assert data["options"][1]["model"] == "deepseek-chat"
+    assert data["ok"] and data["selected"] == data["default"] == "ClaudeAPI"
+    assert [(o["vendor"], o["entry"], o["model"]) for o in data["options"]] == \
+        [("deepseek", "DeepSeekLLM", "deepseek-chat")]  # 没配好的厂商不列
     # 设备上次切到的模型（呼名或在屏幕上切换）才是它实际会用的
     llm_router.store().put("dev-1", {"model": "DeepSeekLLM"})
     data = await (await kiosk.get("/kiosk/llm?device=dev-1")).json()
-    assert data["selected"] == "DeepSeekLLM" and data["default"] == "ClaudeCLI"
+    assert data["selected"] == "DeepSeekLLM" and data["default"] == "ClaudeAPI"
     llm_router.store().put("dev-1", {"model": "ChatGLMLLM"})  # 没配好：退回默认
-    assert (await (await kiosk.get("/kiosk/llm?device=dev-1")).json())["selected"] == "ClaudeCLI"
+    assert (await (await kiosk.get("/kiosk/llm?device=dev-1")).json())["selected"] == "ClaudeAPI"
 
 
 async def test_kiosk_llm_use_is_per_device(kiosk, cfg_path, monkeypatch):
-    """设备上切模型同呼名切换：只切这台设备（在线连接马上跟着切）、记住它；后台默认模型和意图识别不变，
+    """设备上切模型同呼名切换：只切这台设备（在线连接马上跟着切）、记住它；后台默认模型不变，
     运行中的默认实例不重建；直接返回切换后的模型列表。"""
     switched = []
     monkeypatch.setattr(llm_router, "switch", lambda conn, name, remember=True: switched.append((conn.session_id, name, remember)))
     rebuilt = []
     monkeypatch.setattr(ah, "initialize_modules", lambda *a, **k: rebuilt.append(k) or {})
-    await kiosk.post("/admin/api/llm/vendors/deepseek",
-                     json={"base_url": "https://api.deepseek.com", "model": "deepseek-chat", "api_key": "sk-ds-123456789"})
+    _configure_deepseek(cfg_path)
     await kiosk.post("/admin/api/logout", json={})
     before = cfg_path.read_text(encoding="utf-8")
     mine = SimpleNamespace(session_id="s-8", device_id="dev-8", client_ip="127.0.0.1")
@@ -344,97 +209,91 @@ async def test_kiosk_llm_use_is_per_device(kiosk, cfg_path, monkeypatch):
     connections.register(mine)
     connections.register(other)
     try:
-        r = await kiosk.post("/kiosk/llm/use", json={"kind": "api", "vendor": "deepseek", "device": "dev-8"})
+        r = await kiosk.post("/kiosk/llm/use", json={"vendor": "deepseek", "device": "dev-8"})
         data = await r.json()
         assert r.status == 200 and data["ok"]
-        assert data["selected"] == "DeepSeekLLM" and data["default"] == "ClaudeCLI"  # 返回切换后的列表
-        assert [o["entry"] for o in data["options"]] == ["ClaudeCLI", "DeepSeekLLM"]
+        assert data["selected"] == "DeepSeekLLM" and data["default"] == "ClaudeAPI"  # 返回切换后的列表
+        assert [o["entry"] for o in data["options"]] == ["DeepSeekLLM"]
         assert switched == [("s-8", "DeepSeekLLM", False)]  # 别的设备不动
         assert llm_router.store().get("dev-8")["model"] == "DeepSeekLLM"
         assert cfg_path.read_text(encoding="utf-8") == before and rebuilt == []  # 不写配置、不重建默认实例
         # 后台保存了但没设成默认的条目补进运行中的配置，切换时照它创建实例
         assert kiosk.handler.config["LLM"]["DeepSeekLLM"]["model_name"] == "deepseek-chat"
-        assert kiosk.handler.config["selected_module"] == {"LLM": "ClaudeCLI", "Intent": "nointent"}
+        assert kiosk.handler.config["selected_module"] == {"LLM": "ClaudeAPI", "Intent": "nointent"}
 
-        r = await kiosk.post("/kiosk/llm/use", json={"kind": "cli", "device": "dev-8"})
-        assert r.status == 200 and switched[-1] == ("s-8", "ClaudeCLI", False)
-        assert (await r.json())["selected"] == "ClaudeCLI"
-        r = await kiosk.post("/kiosk/llm/use", json={"kind": "api", "vendor": "openai", "device": "dev-8"})
-        assert r.status == 400 and "还没配置好" in (await r.json())["error"] and len(switched) == 2
-        assert (await kiosk.post("/kiosk/llm/use", json={"kind": "cli"})).status == 400  # 要说明是哪台设备
+        r = await kiosk.post("/kiosk/llm/use", json={"vendor": "openai", "device": "dev-8"})
+        assert r.status == 400 and "还没配置好" in (await r.json())["error"] and len(switched) == 1
+        assert (await kiosk.post("/kiosk/llm/use", json={"vendor": "nope", "device": "dev-8"})).status == 404
+        assert (await kiosk.post("/kiosk/llm/use", json={"vendor": "deepseek"})).status == 400  # 要说明是哪台设备
     finally:
         connections.unregister(mine)
         connections.unregister(other)
 
 
-async def test_kiosk_llm_use_failure_keeps_old_model(kiosk, monkeypatch):
-    def boom(conn, name, remember=True):
-        raise RuntimeError("claude 启动失败")
-    monkeypatch.setattr(llm_router, "switch", boom)
-    await kiosk.post("/admin/api/llm/vendors/deepseek",
-                     json={"base_url": "https://api.deepseek.com", "model": "deepseek-chat", "api_key": "sk-ds-123456789"})
+async def test_kiosk_llm_vendor_entry_migrated_to_pi(kiosk, cfg_path):
+    """迁移 0001 改成 type: pi 的厂商条目：设备上还按厂商列（设备靠 vendor 选图标、显示厂商名），
+    不当成模型服务的模型；只发 vendor 也能切过去。"""
+    _migrate_to_pi(cfg_path, "DeepSeekLLM", model_name="deepseek-chat")
     await kiosk.post("/admin/api/logout", json={})
-    llm_router.store().put("dev-8", {"model": "DeepSeekLLM"})
+    data = await (await kiosk.get("/kiosk/llm")).json()
+    assert data["options"] == [{"kind": "api", "vendor": "deepseek", "label": "DeepSeek", "entry": "DeepSeekLLM",
+                                "model": "deepseek-chat"}]
+    r = await kiosk.post("/kiosk/llm/use", json={"vendor": "deepseek", "device": "dev-1"})
+    assert r.status == 200 and llm_router.store().get("dev-1")["model"] == "DeepSeekLLM"
+
+
+async def test_kiosk_llm_use_failure_keeps_old_model(kiosk, cfg_path, monkeypatch):
+    def boom(conn, name, remember=True):
+        raise RuntimeError("Pi 引擎启动失败")
+    monkeypatch.setattr(llm_router, "switch", boom)
+    _configure_deepseek(cfg_path)
+    await kiosk.post("/admin/api/logout", json={})
+    llm_router.store().put("dev-8", {"model": "KimiLLM"})
     fake = SimpleNamespace(session_id="s-8", device_id="dev-8", client_ip="127.0.0.1")
     connections.register(fake)
     try:
-        r = await kiosk.post("/kiosk/llm/use", json={"kind": "cli", "device": "dev-8"})
-        assert r.status == 500 and "claude 启动失败" in (await r.json())["error"]
-        assert llm_router.store().get("dev-8")["model"] == "DeepSeekLLM"  # 还记着原来的
+        r = await kiosk.post("/kiosk/llm/use", json={"vendor": "deepseek", "device": "dev-8"})
+        assert r.status == 500 and "Pi 引擎启动失败" in (await r.json())["error"]
+        assert llm_router.store().get("dev-8")["model"] == "KimiLLM"  # 还记着原来的
         llm_router.store().forget("dev-8")
-        r = await kiosk.post("/kiosk/llm/use", json={"kind": "cli", "device": "dev-8"})
+        r = await kiosk.post("/kiosk/llm/use", json={"vendor": "deepseek", "device": "dev-8"})
         assert r.status == 500 and llm_router.store().get("dev-8") is None
     finally:
         connections.unregister(fake)
 
 
-async def test_kiosk_grok_bot_is_per_device(kiosk, cfg_path, monkeypatch):
-    """Grok Bot 也列出来；选它和喊称呼一样：只切这台设备、记住它，默认模型不变。"""
+async def test_kiosk_model_service_model_is_per_device(kiosk, cfg_path, monkeypatch):
+    """模型服务里的模型也列出来；选它和喊称呼一样：只切这台设备、记住它，默认模型不变。"""
     switched = []
     monkeypatch.setattr(llm_router, "switch", lambda conn, name, remember=True: switched.append((conn.session_id, name, remember)))
-    custom = config_store.load_custom(cfg_path)
-    custom["LLM"]["GrokBot_孙悟空"] = {"type": "grok_bot", "bot_id": "bot-1", "bot_name": "孙悟空"}
-    custom["LLM"]["GrokBot_没勾好"] = {"type": "grok_bot", "bot_name": "没勾好"}
-    config_store.save_custom(custom, cfg_path)
+    with config_store.edit_custom(cfg_path) as data:
+        data["model_services"] = {"lan": {"name": "局域网", "base_url": "http://192.168.1.5:1234/v1", "api_key": ""}}
+        data["LLM"]["Service_lan_qwen"] = {"type": "pi", "service_id": "lan", "model_name": "qwen3-8b"}
+        data["LLM"]["Service_gone_qwen"] = {"type": "pi", "service_id": "gone", "model_name": "qwen3-8b"}
     await kiosk.post("/admin/api/logout", json={})
     data = await (await kiosk.get("/kiosk/llm?device=dev-1")).json()
-    assert data["options"][-1] == {"kind": "grok", "vendor": "grok_bot", "label": "孙悟空",
-                                   "entry": "GrokBot_孙悟空", "model": "Grok Bot"}
-    assert all(o["entry"] != "GrokBot_没勾好" for o in data["options"])  # 没有 bot_id 的不列
+    assert data["options"] == [{"kind": "api", "vendor": "custom", "label": "qwen3-8b", "entry": "Service_lan_qwen",
+                                "model": "qwen3-8b"}]  # 服务删掉了的不列
     mine = SimpleNamespace(session_id="s-1", device_id="dev-1", client_ip="127.0.0.1")
     other = SimpleNamespace(session_id="s-2", device_id="dev-2", client_ip="127.0.0.1")
     connections.register(mine)
     connections.register(other)
     try:
-        body = {"kind": "grok", "vendor": "grok_bot", "entry": "GrokBot_孙悟空", "device": "dev-1"}
+        body = {"entry": "Service_lan_qwen", "device": "dev-1"}
         r = await kiosk.post("/kiosk/llm/use", json=body)
         assert r.status == 200 and (await r.json())["ok"]
-        assert switched == [("s-1", "GrokBot_孙悟空", False)]  # 别的设备不动
-        assert merged(cfg_path)["selected_module"]["LLM"] == "ClaudeCLI"  # 默认模型不变
-        assert llm_router.store().get("dev-1")["model"] == "GrokBot_孙悟空"
+        assert switched == [("s-1", "Service_lan_qwen", False)]  # 别的设备不动
+        assert merged(cfg_path)["selected_module"]["LLM"] == "ClaudeAPI"  # 默认模型不变
+        assert llm_router.store().get("dev-1")["model"] == "Service_lan_qwen"
         data = await (await kiosk.get("/kiosk/llm?device=dev-1")).json()
-        assert data["selected"] == "GrokBot_孙悟空" and data["default"] == "ClaudeCLI"
+        assert data["selected"] == "Service_lan_qwen" and data["default"] == "ClaudeAPI"
         assert (await kiosk.post("/kiosk/llm/use", json={**body, "device": ""})).status == 400
-        assert (await kiosk.post("/kiosk/llm/use", json={**body, "entry": "GrokBot_没勾好"})).status == 404
-        assert (await kiosk.post("/kiosk/llm/use", json={**body, "entry": "DeepSeekLLM"})).status == 404
+        assert (await kiosk.post("/kiosk/llm/use", json={**body, "entry": "Service_gone_qwen"})).status == 400
+        r = await kiosk.post("/kiosk/llm/use", json={**body, "entry": "DeepSeekLLM"})  # 还是占位 Key
+        assert r.status == 400 and "DeepSeek 还没配置好" in (await r.json())["error"]
     finally:
         connections.unregister(mine)
         connections.unregister(other)
-
-
-async def test_kiosk_reports(kiosk):
-    reports.clear()
-    try:
-        assert (await kiosk.post("/kiosk/reports", json={})).status == 400
-        reports.add("dev-1", "bot-1", "孙悟空做完了：好。")
-        data = await (await kiosk.post("/kiosk/reports", json={"device": "dev-1", "quiet": True})).json()
-        assert data == {"ok": True, "count": 1, "playing": False}
-        assert "dev-1" in reports._quiet
-        data = await (await kiosk.post("/kiosk/reports", json={"device": "dev-1", "play": True})).json()
-        assert data == {"ok": True, "count": 1, "playing": False}  # 设备没连着，念不了
-        assert "dev-1" not in reports._quiet
-    finally:
-        reports.clear()
 
 
 async def test_kiosk_asr(kiosk):
@@ -461,22 +320,24 @@ async def test_kiosk_chat_history_and_clear(kiosk, tmp_path, monkeypatch):
     monkeypatch.setattr(chat_history, "get_project_dir", lambda: str(tmp_path))
     store = chat_history.db()
     store.insert("dev-1", "DeepSeekLLM", "user", "我叫小明")
-    store.insert("dev-1", "DeepSeekLLM", "assistant", "你好小明")
-    store.insert("dev-1", "ClaudeCLI", "user", "看看日志")
+    deepseek_last = store.insert("dev-1", "DeepSeekLLM", "assistant", "你好小明")
+    kimi_last = store.insert("dev-1", "KimiLLM", "user", "讲个笑话")
     store.insert("dev-2", "DeepSeekLLM", "user", "别人的")
     assert (await kiosk.get("/kiosk/chat/history")).status == 400
     data = await (await kiosk.get("/kiosk/chat/history?device=dev-1&limit=1")).json()
     assert data["ok"] and {k: [m["text"] for m in v] for k, v in data["models"].items()} == \
-        {"DeepSeekLLM": ["你好小明"], "ClaudeCLI": ["看看日志"]}
+        {"DeepSeekLLM": ["你好小明"], "KimiLLM": ["讲个笑话"]}
     assert (await kiosk.get("/kiosk/chat/history?device=dev-1&limit=x")).status == 400
 
     store.set_memory("dev-1", "- 用户叫小明", "summary", progress={"DeepSeekLLM": 1})
     data = await (await kiosk.post("/kiosk/chat/clear", json={"device": "dev-1", "memory_only": True})).json()
-    assert data == {"ok": True, "deleted": 0, "agents": []}
-    assert store.memory("dev-1")["summary"] == "" and store.progress("dev-1") == {"DeepSeekLLM": 1}
+    assert data == {"ok": True, "deleted": 0}
+    # 只清记忆、记录留着；清空前的记录不再总结回记忆（进度跳到各模型的最后一条）
+    assert store.memory("dev-1")["summary"] == "" and \
+        store.progress("dev-1") == {"DeepSeekLLM": deepseek_last, "KimiLLM": kimi_last}
     assert (await kiosk.post("/kiosk/chat/clear", json={})).status == 400
     data = await (await kiosk.post("/kiosk/chat/clear", json={"device": "dev-1"})).json()
-    assert data == {"ok": True, "deleted": 3, "agents": ["Claude"]}
+    assert data == {"ok": True, "deleted": 3}
     assert (await (await kiosk.get("/kiosk/chat/history?device=dev-1")).json())["models"] == {}
     assert store.models("dev-2") == ["DeepSeekLLM"]
 
@@ -486,24 +347,28 @@ async def test_memory_page(client, tmp_path):
 
     store = chat_history.db()
     store.insert("dev-1", "DeepSeekLLM", "user", "我叫小明")
-    store.insert("dev-1", "ClaudeCLI", "user", "看看日志")
+    store.insert("dev-1", "KimiLLM", "user", "讲个笑话")
     store.set_memory("dev-1", "- 用户叫小明", "summary")
     data = await (await client.get("/admin/api/memory")).json()
     assert data["ok"] and data["settings"]["max_messages"] == 30
     [dev] = data["devices"]
     assert dev["device"] == "dev-1" and dev["memory"]["summary"] == "- 用户叫小明" and dev["memory"]["source"] == "summary"
     assert dev["memory"]["updated"] and dev["online"] is False
-    assert {(m["entry"], m["count"], m["agent"]) for m in dev["models"]} == {("DeepSeekLLM", 1, False), ("ClaudeCLI", 1, True)}
+    assert {(m["entry"], m["count"]) for m in dev["models"]} == {("DeepSeekLLM", 1), ("KimiLLM", 1)}
 
-    v = dev["memory"]["version"]
+    v, auto = dev["memory"]["version"], dev["memory"]["summary"]
+    # 后台分两栏改记忆；不指定 kind 时改手动保留的那份，自动整理的不动
     r = await client.post("/admin/api/memory/save", json={"device": "dev-1", "summary": "- 用户叫小红", "version": v})
-    assert r.status == 200 and (await r.json())["memory"]["summary"] == "- 用户叫小红"
+    mem = (await r.json())["memory"]
+    assert r.status == 200 and mem["pinned"] == "- 用户叫小红" and mem["summary"] == auto
     assert store.memory("dev-1")["source"] == "manual"
     r = await client.post("/admin/api/memory/save", json={"device": "dev-1", "summary": "旧的", "version": v})
-    assert r.status == 409 and (await r.json())["memory"]["summary"] == "- 用户叫小红"
-    r = await client.post("/admin/api/memory/save", json={"device": "dev-1", "summary": ""})
-    assert r.status == 200 and store.memory("dev-1")["summary"] == ""
+    assert r.status == 409 and (await r.json())["memory"]["pinned"] == "- 用户叫小红"
+    r = await client.post("/admin/api/memory/save", json={"device": "dev-1", "kind": "summary", "summary": ""})
+    mem = store.memory("dev-1")
+    assert r.status == 200 and mem["summary"] == "" and mem["pinned"] == "- 用户叫小红"
     assert (await client.post("/admin/api/memory/save", json={"device": "dev-1"})).status == 400
+    assert (await client.post("/admin/api/memory/save", json={"device": "dev-1", "kind": "x", "summary": "x"})).status == 400
     assert (await client.post("/admin/api/memory/save", json={"device": "dev-1", "summary": "长" * 5001})).status == 400
 
     await client.post("/admin/api/logout", json={})
@@ -529,9 +394,8 @@ def test_sherpa_recognize_pcm():
 
 
 async def test_kiosk_only_from_this_machine(kiosk, monkeypatch):
-    calls = [("get", "/kiosk/llm", None), ("post", "/kiosk/llm/use", {"kind": "cli"}),
-             ("post", "/kiosk/reports", {"device": "dev-1"}), ("post", "/kiosk/asr", None),
-             ("post", "/kiosk/tts", {"text": "该晾衣服了"}),
+    calls = [("get", "/kiosk/llm", None), ("post", "/kiosk/llm/use", {"vendor": "deepseek", "device": "dev-1"}),
+             ("post", "/kiosk/asr", None), ("post", "/kiosk/tts", {"text": "该晾衣服了"}),
              ("get", "/kiosk/chat/history?device=dev-1", None), ("post", "/kiosk/chat/clear", {"device": "dev-1"})]
     for method, path, body in calls:  # 本机反向代理转发来的不算本机
         r = await getattr(kiosk, method)(path, json=body, headers={"X-Forwarded-For": "203.0.113.5"})
@@ -540,20 +404,6 @@ async def test_kiosk_only_from_this_machine(kiosk, monkeypatch):
     for method, path, body in calls:
         r = await getattr(kiosk, method)(path, json=body)
         assert r.status == 403 and (await r.json())["error"] == "仅限本机"
-
-
-async def test_vendor_test_endpoint(client, monkeypatch):
-    seen = {}
-
-    def fake_test(config):
-        seen.update(config)
-        return {"ok": False, "error": "API Key 不对或已失效"}
-    monkeypatch.setattr(ah.AdminHandler, "_test_llm", staticmethod(fake_test))
-    r = await client.post("/admin/api/llm/vendors/openai/test", json={"model": "gpt-5-mini", "api_key": "sk-x"})
-    assert r.status == 400 and (await r.json())["error"] == "API Key 不对或已失效"
-    assert seen["base_url"] == "https://api.openai.com/v1" and seen["timeout"] == 20
-    r = await client.post("/admin/api/llm/vendors/openai/test", json={"model": "gpt-5-mini"})
-    assert r.status == 400 and "API Key" in (await r.json())["error"]
 
 
 async def test_emotion_single_and_stop(client):
@@ -585,59 +435,42 @@ async def test_emotion_single_and_stop(client):
 
 # ---------- 呼名 ----------
 
-def test_claude_cli_new_fields_can_be_added(cfg_path):
-    """老配置里没有的进度提示两项，后台也能设置；留空不写入、不报错。"""
-    assert pages.save_claude_cli({"progress_interval_seconds": "", "progress_reply": ""}, merged(cfg_path), cfg_path) == []
-    changed = pages.save_claude_cli({"progress_interval_seconds": "45", "progress_reply": "还在弄"}, merged(cfg_path), cfg_path)
-    assert set(changed) == {"progress_interval_seconds", "progress_reply"}
-    entry = merged(cfg_path)["LLM"]["ClaudeCLI"]
-    assert entry["progress_interval_seconds"] == 45 and entry["progress_reply"] == "还在弄"
-    with pytest.raises(ValueError):
-        pages.save_claude_cli({"progress_interval_seconds": "-1"}, merged(cfg_path), cfg_path)
-    assert pages.save_claude_cli({"progress_interval_seconds": "0"}, merged(cfg_path), cfg_path)  # 0 表示关闭
-
-
 def test_describe_call_names_defaults(cfg_path):
     d = pages.describe_call_names(merged(cfg_path))
-    assert d["enabled"] is True and d["default"] == "ClaudeCLI"
-    assert [m["entry"] for m in d["models"]] == ["ClaudeCLI"] and "cloud" in d["models"][0]["aliases"]
-    assert d["models"][0]["ready"] is True
-    assert [t["entry"] for t in d["targets"]] == ["ClaudeCLI"]  # API 厂商都还没填 Key，不能选
+    assert d["enabled"] is True and d["default"] == "ClaudeAPI"
+    assert d["models"] == [] and d["targets"] == []  # 还没配称呼；API 厂商都还没填 Key，不能选
 
 
-def _configure_deepseek(path):
-    pages.save_vendor("deepseek", {"base_url": "https://api.deepseek.com", "api_key": "sk-1234567890abcdef",
-                                   "model": "deepseek-chat"}, merged(path), path)
-
-
-def test_describe_call_names_legacy_key_and_targets(cfg_path):
+def test_describe_call_names_targets(cfg_path):
     with config_store.edit_custom(cfg_path) as data:
-        data["call_names"] = {"models": {"claude": ["cloud"]}}  # 第一期的写法
+        data["call_names"] = {"models": {"DeepSeekLLM": ["deepseek"], "KimiLLM": ["kimi"]}}
     _configure_deepseek(cfg_path)
     d = pages.describe_call_names(merged(cfg_path))
-    assert [(m["entry"], m["aliases"]) for m in d["models"]] == [("ClaudeCLI", ["cloud"])]
-    defaults = {t["entry"]: t["defaults"] for t in d["targets"]}
-    assert defaults["DeepSeekLLM"] == ["deepseek"]
-    assert defaults["ClaudeCLI"] == ["claude", "cloud", "clod", "clot", "克劳德"]
+    assert [(m["entry"], m["aliases"], m["ready"]) for m in d["models"]] == \
+        [("DeepSeekLLM", ["deepseek"], True), ("KimiLLM", ["kimi"], False)]
+    assert {t["entry"]: t["defaults"] for t in d["targets"]} == {"DeepSeekLLM": ["deepseek"]}
 
 
 def test_call_targets_defaults_use_english_vendor_id(cfg_path):
-    for vid in ("qwen", "claude"):
-        pages.save_vendor(vid, {"base_url": "https://example.com", "api_key": "sk-1234567890abcdef",
-                                "model": "m"}, merged(cfg_path), cfg_path)
-    defaults = {t["entry"]: t["defaults"] for t in pages.call_targets(merged(cfg_path))}
-    assert defaults["AliLLM"] == ["qwen"]  # 中文名“通义千问”也只填英文
-    assert defaults["ClaudeAPI"] == []  # claude 已给本机 Claude Code
+    for entry in ("AliLLM", "ClaudeAPI"):
+        _configure(cfg_path, entry, api_key=KEY)
+    _migrate_to_pi(cfg_path, "DeepSeekLLM", model_name="deepseek-chat")
+    targets = {t["entry"]: t for t in pages.call_targets(merged(cfg_path))}
+    assert targets["AliLLM"]["defaults"] == ["qwen"]  # 中文名“通义千问”也只填英文
+    assert targets["ClaudeAPI"]["defaults"] == ["claude"]
+    # 迁移 0001 改成 type: pi 的厂商条目也按厂商：显示厂商名、预填厂商的称呼
+    assert targets["DeepSeekLLM"] == {"entry": "DeepSeekLLM", "label": "DeepSeek（API）", "defaults": ["deepseek"]}
 
 
 def test_save_call_names_validates_and_writes(cfg_path):
     _configure_deepseek(cfg_path)
-    payload = {"reply": "在呢", "models": [{"entry": "ClaudeCLI", "aliases": ["Cloud", "克劳德", "cloud", " "]},
+    _configure(cfg_path, "ClaudeAPI", api_key=KEY)
+    payload = {"reply": "在呢", "models": [{"entry": "ClaudeAPI", "aliases": ["Cloud", "克劳德", "cloud", " "]},
                                           {"entry": "DeepSeekLLM", "aliases": ["深度求索"]}]}
     changed = pages.save_call_names(payload, merged(cfg_path), cfg_path)
     assert set(changed) == {"models", "reply"}
     d = pages.describe_call_names(merged(cfg_path))
-    assert [(m["entry"], m["aliases"]) for m in d["models"]] == [("ClaudeCLI", ["cloud", "克劳德"]),
+    assert [(m["entry"], m["aliases"]) for m in d["models"]] == [("ClaudeAPI", ["cloud", "克劳德"]),
                                                                 ("DeepSeekLLM", ["深度求索"])]  # 去重、去空、转小写
     assert d["reply"] == "在呢"
     assert pages.save_call_names(payload, merged(cfg_path), cfg_path) == []
@@ -645,11 +478,11 @@ def test_save_call_names_validates_and_writes(cfg_path):
     def models(*items):
         return {"models": [{"entry": e, "aliases": a} for e, a in items]}
 
-    for bad, msg in ((models(("ClaudeCLI", ["cloud code"])), "空格或标点"), (models(("ClaudeCLI", ["c"])), "2 到 20"),
-                     (models(("ClaudeCLI", ["hi"])), "招呼语"), (models(("ClaudeCLI", [])), "至少要有一个称呼"),
+    for bad, msg in ((models(("ClaudeAPI", ["cloud code"])), "空格或标点"), (models(("ClaudeAPI", ["c"])), "2 到 20"),
+                     (models(("ClaudeAPI", ["hi"])), "招呼语"), (models(("ClaudeAPI", [])), "至少要有一个称呼"),
                      (models(), "至少要给一个模型"), (models(("KimiLLM", ["kimi"])), "还没配置好"),
-                     (models(("ClaudeCLI", ["cloud"]), ("DeepSeekLLM", ["cloud"])), "只能给一个模型"),
-                     (models(("ClaudeCLI", ["cloud"]), ("ClaudeCLI", ["claude"])), "重复")):
+                     (models(("ClaudeAPI", ["cloud"]), ("DeepSeekLLM", ["cloud"])), "只能给一个模型"),
+                     (models(("ClaudeAPI", ["cloud"]), ("ClaudeAPI", ["claude"])), "重复")):
         with pytest.raises(ValueError, match=msg):
             pages.save_call_names(bad, merged(cfg_path), cfg_path)
     assert pages.save_call_names({"models": [], "enabled": False}, merged(cfg_path), cfg_path)  # 关闭时可以不留称呼
@@ -667,24 +500,25 @@ def test_save_call_names_keeps_model_no_longer_configured(cfg_path):
                                  merged(cfg_path), cfg_path) == ["models"]
 
 
-async def test_call_names_endpoints_apply_to_online_connections(client):
+async def test_call_names_endpoints_apply_to_online_connections(client, cfg_path):
     from core.agent.call_names import learner
 
+    _configure_deepseek(cfg_path)
     fake = SimpleNamespace(session_id="s-7", device_id="dev-7", client_ip="x", config={})
     connections.register(fake)
     try:
         d = await (await client.get("/admin/api/call-names")).json()
         assert d["ok"] and d["devices"][0]["session_id"] == "s-7" and d["learning"]["active"] is False
-        r = await client.post("/admin/api/call-names", json={"models": [{"entry": "ClaudeCLI", "aliases": ["cloud", "克老德"]}]})
+        r = await client.post("/admin/api/call-names", json={"models": [{"entry": "DeepSeekLLM", "aliases": ["deepseek", "深度求索"]}]})
         assert r.status == 200 and (await r.json())["changed"] == ["models"]
-        assert fake.config["call_names"]["models"]["ClaudeCLI"] == ["cloud", "克老德"]  # 在线连接马上生效
-        assert client.handler.config["call_names"]["models"]["ClaudeCLI"] == ["cloud", "克老德"]
-        bad = {"models": [{"entry": "ClaudeCLI", "aliases": ["x y"]}]}
+        assert fake.config["call_names"]["models"]["DeepSeekLLM"] == ["deepseek", "深度求索"]  # 在线连接马上生效
+        assert client.handler.config["call_names"]["models"]["DeepSeekLLM"] == ["deepseek", "深度求索"]
+        bad = {"models": [{"entry": "DeepSeekLLM", "aliases": ["x y"]}]}
         assert (await client.post("/admin/api/call-names", json=bad)).status == 400
 
-        r = await (await client.post("/admin/api/call-names/learn", json={"target": "ClaudeCLI"})).json()
+        r = await (await client.post("/admin/api/call-names/learn", json={"target": "DeepSeekLLM"})).json()
         assert r["learning"]["active"] and r["learning"]["session_id"] == "s-7"  # 只有一台在线时自动选它
-        assert r["learning"]["target"] == "ClaudeCLI"
+        assert r["learning"]["target"] == "DeepSeekLLM"
         assert (await client.post("/admin/api/call-names/learn", json={"session_id": "gone"})).status == 400
         r = await (await client.post("/admin/api/call-names/learn/stop", json={})).json()
         assert r["learning"]["active"] is False

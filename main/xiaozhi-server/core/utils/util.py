@@ -135,7 +135,8 @@ def get_ip_info(ip_addr, logger):
         if is_private_ip(ip_addr):
             ip_addr = ""
         url = f"https://whois.pconline.com.cn/ipJson.jsp?json=true&ip={ip_addr}"
-        resp = requests.get(url).json()
+        # IP 定位只是可选信息，限制连接和读取等待，失败后使用配置里的所在地。
+        resp = requests.get(url, timeout=(2.0, 3.0)).json()
         ip_info = {"city": resp.get("city")}
 
         # 存入缓存
@@ -263,15 +264,6 @@ def check_ffmpeg_installed() -> bool:
 
         # 抛出详细异常信息
         raise ValueError("\n".join(error_msg)) from e
-
-
-def extract_json_from_string(input_string):
-    """提取字符串中的 JSON 部分"""
-    pattern = r"(\{.*\})"
-    match = re.search(pattern, input_string, re.DOTALL)  # 添加 re.DOTALL
-    if match:
-        return match.group(1)  # 返回提取的 JSON 字符串
-    return None
 
 
 def audio_to_data_stream(

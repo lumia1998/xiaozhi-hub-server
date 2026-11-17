@@ -48,6 +48,7 @@ class OTAHandler(BaseHandler):
         super().__init__(config)
         auth_config = config["server"].get("auth", {})
         self.auth_enable = auth_config.get("enabled", False)
+        self.device_auth_enable = bool((auth_config.get("device_auth") or {}).get("enabled", False))
         # 设备白名单
         self.allowed_devices = set(auth_config.get("allowed_devices", []))
         secret_key = config["server"]["auth_key"]
@@ -280,19 +281,28 @@ class OTAHandler(BaseHandler):
                 self.logger.bind(tag=TAG).info(f"为设备 {device_id} 下发MQTT网关配置")
 
             else:  # 未配置 mqtt_gateway，下发 WebSocket
-                # 如果开启了认证，则进行认证校验
-                token = ""
-                if self.auth_enable:
-                    if self.allowed_devices:
-                        if device_id not in self.allowed_devices:
+                if self.device_auth_enable:
+                    # Pairing tokens are issued once from the authenticated admin UI.
+                    # OTA must never mint or disclose a reusable device pairing token.
+                    return_json["websocket"] = {
+                        "url": self._get_websocket_url(local_ip, websocket_port),
+                        "token": "",
+                        "pairing_required": True,
+                    }
+                else:
+                    # 如果开启了认证，则进行认证校验
+                    token = ""
+                    if self.auth_enable:
+                        if self.allowed_devices:
+                            if device_id not in self.allowed_devices:
+                                token = self.auth.generate_token(client_id, device_id)
+                        else:
                             token = self.auth.generate_token(client_id, device_id)
-                    else:
-                        token = self.auth.generate_token(client_id, device_id)
-                # NOTE: use websocket_port here
-                return_json["websocket"] = {
-                    "url": self._get_websocket_url(local_ip, websocket_port),
-                    "token": token,
-                }
+                    # NOTE: use websocket_port here
+                    return_json["websocket"] = {
+                        "url": self._get_websocket_url(local_ip, websocket_port),
+                        "token": token,
+                    }
                 self.logger.bind(tag=TAG).info(
                     f"未配置MQTT网关，为设备 {device_id} 下发WebSocket配置"
                 )

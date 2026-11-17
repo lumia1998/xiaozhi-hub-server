@@ -14,6 +14,14 @@ class SimpleHttpServer:
         self.ota_handler = OTAHandler(config)
         self.vision_handler = VisionHandler(config)
 
+    def update_config(self, config: dict):
+        """Keep OTA auth flags in sync with the live Hub configuration."""
+        self.config = config
+        self.ota_handler.config = config
+        auth = (config.get("server", {}).get("auth") or {})
+        self.ota_handler.auth_enable = bool(auth.get("enabled", False))
+        self.ota_handler.device_auth_enable = bool((auth.get("device_auth") or {}).get("enabled", False))
+
     def _get_websocket_url(self, local_ip: str, port: int) -> str:
         """获取websocket地址
 

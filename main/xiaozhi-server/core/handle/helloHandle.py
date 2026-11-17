@@ -1,42 +1,22 @@
 import time
 import json
 import uuid
-import random
 import asyncio
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from core.connection import ConnectionHandler
 from core.utils.dialogue import Message
-from core.utils.util import audio_to_data
 from core.providers.tts.dto.dto import SentenceType
-from core.utils.wakeup_word import WakeupWordsConfig
+from core.agent import call_names
+from core.utils import turn_gen
 from core.handle.sendAudioHandle import sendAudioMessage, send_tts_message
-from core.utils.util import remove_punctuation_and_length, opus_datas_to_wav_bytes
+from core.utils.util import remove_punctuation_and_length
 from core.providers.tools.device_mcp import MCPClient, send_mcp_initialize_message
 
 TAG = __name__
 
-WAKEUP_CONFIG = {
-    "refresh_time": 10,
-    "responses": [
-        "我一直都在呢，您请说。",
-        "在的呢，请随时吩咐我。",
-        "来啦来啦，请告诉我吧。",
-        "您请说，我正听着。",
-        "请您讲话，我准备好了。",
-        "请您说出指令吧。",
-        "我认真听着呢，请讲。",
-        "请问您需要什么帮助？",
-        "我在这里，等候您的指令。",
-    ],
-}
-
-# 创建全局的唤醒词配置管理器
-wakeup_words_config = WakeupWordsConfig()
-
-# 用于防止并发调用wakeupWordsResponse的锁
-_wakeup_response_lock = asyncio.Lock()
+WAKE_REPLY_TIMEOUT = 8
 
 
 async def handleHelloMessage(conn: "ConnectionHandler", msg_json):
@@ -67,101 +47,76 @@ async def handleHelloMessage(conn: "ConnectionHandler", msg_json):
     # The device waits for the server hello before processing MCP messages.
     if features and features.get("mcp"):
         asyncio.create_task(send_mcp_initialize_message(conn))
+    # Results are persisted independently of this connection and claimed only
+    # after the device is online and idle. No legacy report polling is used.
+    asyncio.create_task(_deliver_task_result(conn))
+
+
+async def _deliver_task_result(conn):
+    try:
+        from core.agent.task_delivery import deliver_pending
+        await deliver_pending(conn, wait_for_tts=5)
+    except Exception as exc:
+        conn.logger.bind(tag=TAG).warning(f"后台任务结果投递失败: {type(exc).__name__}")
 
 
 async def checkWakeupWords(conn: "ConnectionHandler", text):
-    enable_wakeup_words_response_cache = conn.config[
-        "enable_wakeup_words_response_cache"
-    ]
-
-    # 等待tts初始化，最多等待3秒
-    start_time = time.time()
-    while time.time() - start_time < 3:
-        if conn.tts:
-            break
-        await asyncio.sleep(0.1)
-    else:
-        return False
-
-    if not enable_wakeup_words_response_cache:
-        return False
-
     _, filtered_text = remove_punctuation_and_length(text)
-    if filtered_text not in conn.config.get("wakeup_words"):
+    if filtered_text not in (conn.config.get("wakeup_words") or []):
+        return False
+    if not conn.config.get("enable_wakeup_words_response_cache", True):
         return False
 
-    # 和 receiveAudioHandle.mark_just_woken_up 一样，这里直接写避免循环导入
+    # 命中的唤醒词始终在这里结束，不因合成失败转交模型或播放其他音色的录音。
+    generation = turn_gen.current(conn)
+    sentence_id = uuid.uuid4().hex
+    conn.sentence_id = sentence_id
+    conn.client_abort = False
     conn.just_woken_up = True
     conn.just_woken_up_at = time.monotonic()
-    await send_tts_message(conn, "start")
 
-    # 获取当前音色
-    voice = getattr(conn.tts, "voice", "default")
-    if not voice:
-        voice = "default"
+    def stale():
+        return (conn.client_abort or conn.sentence_id != sentence_id
+                or turn_gen.stale(conn, generation)
+                or (getattr(conn, "stop_event", None) is not None and conn.stop_event.is_set()))
 
-    # 获取唤醒词回复配置
-    response = wakeup_words_config.get_wakeup_response(voice)
-    if not response or not response.get("file_path"):
-        response = {
-            "voice": "default",
-            "file_path": "config/assets/wakeup_words_short.wav",
-            "time": 0,
-            "text": "我在这里哦！",
-        }
+    if not conn.config.get("enable_greeting", True):
+        await send_tts_message(conn, "stop")
+        return True
 
-    # 获取音频数据
-    opus_packets = await audio_to_data(response.get("file_path"), use_cache=False)
-    # 播放唤醒词回复
-    conn.client_abort = False
-
-    # 将唤醒词回复视为新会话，生成新的 sentence_id，确保流控器重置
-    conn.sentence_id = str(uuid.uuid4().hex)
-
-    conn.logger.bind(tag=TAG).info(f"播放唤醒词回复: {response.get('text')}")
-    await sendAudioMessage(conn, SentenceType.FIRST, opus_packets, response.get("text"))
-    await sendAudioMessage(conn, SentenceType.LAST, [], None)
-
-    # 补充对话
-    conn.dialogue.put(Message(role="assistant", content=response.get("text")))
-
-    # 检查是否需要更新唤醒词回复
-    if time.time() - response.get("time", 0) > WAKEUP_CONFIG["refresh_time"]:
-        if not _wakeup_response_lock.locked():
-            asyncio.create_task(wakeupWordsResponse(conn))
-    return True
-
-
-async def wakeupWordsResponse(conn: "ConnectionHandler"):
+    deadline = time.monotonic() + 3
+    while not conn.tts and time.monotonic() < deadline and not stale():
+        await asyncio.sleep(0.1)
+    if stale():
+        return True
     if not conn.tts:
-        return
+        conn.logger.bind(tag=TAG).warning("唤醒问候：TTS 未就绪，跳过语音回复")
+        await send_tts_message(conn, "stop")
+        return True
 
+    tts = conn.tts
+    reply = call_names.reply_text(conn.config.get("call_names") or {})
+    await send_tts_message(conn, "start")
+    conn.client_is_speaking = True
     try:
-        # 尝试获取锁，如果获取不到就返回
-        if not await _wakeup_response_lock.acquire():
-            return
-
-        # 从预定义回复列表中随机选择一个回复
-        result = random.choice(WAKEUP_CONFIG["responses"])
-        if not result or len(result) == 0:
-            return
-
-        # 生成TTS音频
-        tts_result = await asyncio.to_thread(conn.tts.to_tts, result)
-        if not tts_result:
-            return
-
-        # 获取当前音色
-        voice = getattr(conn.tts, "voice", "default")
-
-        # 使用链接的sample_rate
-        wav_bytes = opus_datas_to_wav_bytes(tts_result, sample_rate=conn.sample_rate)
-        file_path = wakeup_words_config.generate_file_path(voice)
-        with open(file_path, "wb") as f:
-            f.write(wav_bytes)
-        # 更新配置
-        wakeup_words_config.update_wakeup_response(voice, file_path, result)
-    finally:
-        # 确保在任何情况下都释放锁
-        if _wakeup_response_lock.locked():
-            _wakeup_response_lock.release()
+        packets = await call_names.cached_reply(conn, reply, timeout=WAKE_REPLY_TIMEOUT)
+    except Exception as exc:
+        conn.logger.bind(tag=TAG).warning(f"唤醒问候合成失败，跳过语音回复: {type(exc).__name__}")
+        packets = None
+    if stale():
+        return True
+    if conn.tts is not tts or not packets:
+        await send_tts_message(conn, "stop")
+        return True
+    if not (getattr(conn, "features", None) or {}).get("ready_on_tts_start"):
+        await asyncio.sleep(call_names.CACHED_REPLY_DELAY)
+    if stale():
+        return True
+    conn.logger.bind(tag=TAG).info(
+        f"唤醒问候使用当前 TTS: {type(tts).__module__}, {getattr(tts, 'voice', '')}, {reply}")
+    await sendAudioMessage(conn, SentenceType.FIRST, packets, reply, sentence_id)
+    if not stale():
+        await sendAudioMessage(conn, SentenceType.LAST, [], None, sentence_id)
+    if not stale():
+        conn.dialogue.put(Message(role="assistant", content=reply))
+    return True

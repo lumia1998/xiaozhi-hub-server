@@ -1,6 +1,6 @@
 """语音清除聊天记录："清除聊天记录"之类的话先问一遍，说"确定"才清（chat_history.clear，和聊天页设置里的按钮同一个接口）。
 
-在呼名之后、意图识别和大模型之前处理，所以 Claude Code、Grok Bot 也能用。指令、确认和回复都不写进对话。
+在呼名之后、意图识别和大模型之前处理。指令、确认和回复都不写进对话。
 问了之后 CONFIRM_SECONDS 秒内：说确认的话就清，说否定的话就不清，说别的就当没问过、照常交给模型。
 """
 
@@ -48,14 +48,6 @@ def is_cancel(text: str) -> bool:
     return bool(_CANCEL.search(normalize(text)))
 
 
-def result_text(result: dict) -> str:
-    """清除结果的语音回复。聊过 Claude Code / Grok Bot 时说一句它们那边没动（清的只是本机的记录）。"""
-    agents = result.get("agents") or []
-    if agents:
-        return f"{DONE}。{'和'.join(agents)}自己那边的对话没有动"
-    return DONE
-
-
 async def handle(conn: "ConnectionHandler", text: str):
     """返回 None 表示这句话已经处理完；否则返回要继续交给模型的文字。"""
     if text.lstrip().startswith("{"):
@@ -65,9 +57,9 @@ async def handle(conn: "ConnectionHandler", text: str):
         conn.chat_clear_asked = 0
         if time.monotonic() - pending < CONFIRM_SECONDS:
             if is_confirm(text):
-                result = await clear_now(conn)
+                await clear_now(conn)
                 await _notify_cleared(conn)
-                await _speak(conn, text, result_text(result))
+                await _speak(conn, text, DONE)
                 return None
             if is_cancel(text):
                 await _speak(conn, text, KEPT)
@@ -82,20 +74,19 @@ async def handle(conn: "ConnectionHandler", text: str):
 
 async def clear_now(conn: "ConnectionHandler") -> dict:
     from core.admin import connections
-    from core.agent import chat_history, llm_router
+    from core.agent import chat_history
 
     device = chat_history.device_of(conn)
     if not device:
         # 没有 device-id 的连接没存过记录：只清这个连接的对话
         chat_history.clear_dialogues([conn])
-        return {"deleted": 0, "agents": []}
+        return {"deleted": 0}
     online = [c for c in (connections.get(i["session_id"]) for i in connections.snapshot()
                           if i["device_id"] == device) if c is not None]
     if conn not in online:
         online.append(conn)
-    config = llm_router._server_config(conn)
     return await asyncio.get_running_loop().run_in_executor(
-        None, lambda: chat_history.clear(device, config, connections=online))
+        None, lambda: chat_history.clear(device, connections=online))
 
 
 async def _notify_cleared(conn: "ConnectionHandler") -> None:

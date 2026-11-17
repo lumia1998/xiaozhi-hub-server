@@ -4,26 +4,6 @@ from typing import List, Dict
 from datetime import datetime
 
 MEMORY_INTRO = "以下是和用户更早的聊天的摘要（那些聊天内容已经不在上下文里），需要时参考："
-FEWSHOT_INTRO = "下面是调用工具的示例，只用来说明工具怎么用，不是和用户的真实对话；用户问聊过什么、让你做过什么时不要提这些示例："
-
-
-def render_fewshot(messages) -> str:
-    """[xiaozhi-hub] 工具调用示例（is_temporary）写成系统提示里的一段文字。
-    当成对话轮次发的话，模型会当成用户真说过（问"我刚才让你做过什么"答"你让我讲故事、说了拜拜"）。"""
-    lines, n = [], 0
-    for m in messages:
-        if m.role == "user":
-            n += 1
-            lines += [f"示例{n}", f"用户：{m.content}"]
-        elif m.role == "assistant" and m.tool_calls:
-            for tc in m.tool_calls:
-                f = tc.get("function", {})
-                lines.append(f"你：调用工具 {f.get('name')}，参数 {f.get('arguments')}")
-        elif m.role == "tool":
-            lines.append(f"工具返回：{m.content}")
-        elif m.content:
-            lines.append(f"你：{m.content}")
-    return "<tool_call_examples>\n" + FEWSHOT_INTRO + "\n" + "\n".join(lines) + "\n</tool_call_examples>"
 
 
 class Message:
@@ -34,14 +14,12 @@ class Message:
             uniq_id: str = None,
             tool_calls=None,
             tool_call_id=None,
-            is_temporary=False,
     ):
         self.uniq_id = uniq_id if uniq_id is not None else str(uuid.uuid4())
         self.role = role
         self.content = content
         self.tool_calls = tool_calls
         self.tool_call_id = tool_call_id
-        self.is_temporary = is_temporary  # 标记临时消息（如工具调用提醒）
 
 
 class Dialogue:
@@ -57,7 +35,7 @@ class Dialogue:
 
     def getMessages(self, m, dialogue):
         if m.tool_calls is not None:
-            dialogue.append({"role": m.role, "tool_calls": m.tool_calls})
+            dialogue.append({"role": m.role, "content": m.content, "tool_calls": m.tool_calls})
         elif m.role == "tool":
             dialogue.append(
                 {
@@ -70,6 +48,8 @@ class Dialogue:
             )
         else:
             dialogue.append({"role": m.role, "content": m.content})
+        if getattr(m, 'pi_message', None) is not None:
+            dialogue[-1]['_pi_message'] = m.pi_message
 
     def get_llm_dialogue(self) -> List[Dict[str, str]]:
         # 直接调用get_llm_dialogue_with_memory，传入None作为memory_str
@@ -135,11 +115,6 @@ class Dialogue:
                 "{{current_time}}", datetime.now().strftime("%H:%M")
             )
 
-            # [xiaozhi-hub] 工具调用示例放在系统提示里（会话内不变，放在记忆前面）
-            fewshot_messages = [m for m in self.dialogue if m.role != "system" and m.is_temporary]
-            if fewshot_messages:
-                full_prompt += "\n\n" + render_fewshot(fewshot_messages)
-
             # 填充记忆
             if memory_str is not None:
                 full_prompt = re.sub(
@@ -179,8 +154,9 @@ class Dialogue:
 
             dialogue.append({"role": "system", "content": full_prompt})
 
-        # 实际对话历史（few-shot 示例已写进系统提示，不当成对话轮次发）
-        actual_messages = [m for m in self.dialogue if m.role != "system" and not m.is_temporary]
+        from core.agent.chat_history import prune_expired
+        prune_expired(self)
+        actual_messages = [m for m in self.dialogue if m.role != "system"]
         if self.window:
             from core.agent.chat_history import select_window
 

@@ -34,7 +34,7 @@ def demo_plugin(monkeypatch):
 
 CUSTOM_YAML = """\
 selected_module:
-  LLM: ClaudeCLI
+  LLM: ClaudeAPI
   Intent: nointent
 plugins:
   demo_cfg:
@@ -93,7 +93,7 @@ def test_describe_and_save_secret_write_only(cfg_path):
 @pytest.fixture
 async def client(cfg_path):
     app = web.Application()
-    config = {"selected_module": {"LLM": "ClaudeCLI", "Intent": "nointent"}, "LLM": {}, "Intent": {},
+    config = {"selected_module": {"LLM": "ClaudeAPI", "Intent": "nointent"}, "LLM": {}, "Intent": {},
               "plugins": {"demo_cfg": {"api_key": "mk-xxx"}}}
     handler = ah.AdminHandler(config, ws_server=None, config_path=cfg_path)
     handler.register(app)

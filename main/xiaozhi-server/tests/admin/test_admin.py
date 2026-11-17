@@ -99,15 +99,9 @@ def test_update_converts_types(cfg_path):
 
 
 def test_update_list_and_bool_fields(cfg_path):
-    cfg_path.write_text(CUSTOM_YAML + """  ClaudeCLI:
-    type: claude_cli
-    allowed_tools: [Read, Grep, Glob]
-    turn_timeout_seconds: 120
-""", encoding="utf-8")
-    config_store.update_entry("LLM", "ClaudeCLI", {"allowed_tools": "Read, Glob，Grep", "turn_timeout_seconds": "60"},
+    config_store.update_entry("Intent", "function_call", {"functions": "get_weather, play_music，web_search"},
                               merged(cfg_path), cfg_path)
-    e = merged(cfg_path)["LLM"]["ClaudeCLI"]
-    assert e["allowed_tools"] == ["Read", "Glob", "Grep"] and e["turn_timeout_seconds"] == 60
+    assert merged(cfg_path)["Intent"]["function_call"]["functions"] == ["get_weather", "play_music", "web_search"]
     assert config_store.field_kind("enabled", True) == "bool"
     assert config_store._convert("bool", "true", False) is True
 
@@ -179,18 +173,18 @@ async def test_setup_login_and_update_flow(client, cfg_path):
     r = await client.post("/admin/api/setup", json={"password": "another-pass"})
     assert r.status == 409
 
-    assert (await client.get("/admin/api/llm")).status == 200
+    assert (await client.get("/admin/api/model-services")).status == 200
 
     await client.post("/admin/api/logout", json={})
-    assert (await client.get("/admin/api/llm")).status == 401
+    assert (await client.get("/admin/api/model-services")).status == 401
     assert (await client.post("/admin/api/login", json={"password": "pass-1234"})).status == 200
-    assert (await client.get("/admin/api/llm")).status == 200
+    assert (await client.get("/admin/api/model-services")).status == 200
 
 
 async def test_requires_login_and_json(client):
-    assert (await client.get("/admin/api/llm")).status == 401
+    assert (await client.get("/admin/api/model-services")).status == 401
     assert (await client.get("/admin/api/status")).status == 401
-    assert (await client.post("/admin/api/llm/use", json={"vendor": "glm"})).status == 401
+    assert (await client.post("/admin/api/model-services/use", json={"entry": "x"})).status == 401
     r = await client.post("/admin/api/setup", data="password=pass-1234",
                           headers={"Content-Type": "application/x-www-form-urlencoded"})
     assert r.status == 415
@@ -247,11 +241,11 @@ async def test_devices_and_emotion_test(client):
             sent.append(data)
 
     fake = SimpleNamespace(session_id="s-1", device_id="dev-1", client_ip="192.168.6.211", websocket=FakeWS(),
-                           hub_route={"current": "GrokBot_孙悟空"})  # 呼名切到的模型
+                           hub_route={"current": "DeepSeekLLM"})  # 呼名切到的模型
     connections.register(fake)
     try:
         devices = (await (await client.get("/admin/api/devices")).json())["devices"]
-        assert devices[0]["device_id"] == "dev-1" and devices[0]["model_label"] == "孙悟空"
+        assert devices[0]["device_id"] == "dev-1" and devices[0]["model_label"] == "DeepSeek"
         r = await client.post("/admin/api/devices/s-1/emotion-test", json={"interval": 0.5})
         data = await r.json()
         assert r.status == 200 and data == {"ok": True}
@@ -313,28 +307,17 @@ async def test_apply_failure_keeps_running_config(cfg_path, monkeypatch):
     assert running["selected_module"]["LLM"] == "ClaudeAPI" and ws._llm == "old-llm"  # 失败时服务保持原状
 
 
-async def test_apply_retires_replaced_instance(cfg_path, monkeypatch):
+async def test_apply_replaces_running_instance(cfg_path, monkeypatch):
     import asyncio
     from types import SimpleNamespace
     from core.admin import admin_handler as ah
 
-    class OldLLM:
-        retired = False
-
-        def shutdown(self):
-            self.retired = True
-
     new_llm = object()
     monkeypatch.setattr(ah, "initialize_modules", lambda *a, **k: {"llm": new_llm})
-    old = OldLLM()
-    ws = SimpleNamespace(config_lock=asyncio.Lock(), _llm=old)
+    ws = SimpleNamespace(config_lock=asyncio.Lock(), _llm="old-llm")
     running = {"selected_module": {"LLM": "ClaudeAPI"}, "LLM": {"ClaudeAPI": {"type": "openai"}}}
     h = ah.AdminHandler(running, ws_server=ws, config_path=cfg_path)
     config_store.select_entry("LLM", "ChatGLMLLM", config_store.load_merged(custom_path=cfg_path), cfg_path)
-    assert (await h._apply("LLM"))["applied"] is True
-    assert ws._llm is new_llm and old.retired  # 替换后通知旧实例退役
-
-    ws._llm = "plain-llm"  # 没有 shutdown 方法的实例直接替换，不报错
     assert (await h._apply("LLM"))["applied"] is True and ws._llm is new_llm
 
 
@@ -386,7 +369,7 @@ def test_missing_packages_real_providers(monkeypatch):
     try:
         assert deps.missing_packages("ASR", "sherpa_onnx_local") == ()  # 默认 ASR，精简安装也必须齐全
         assert deps.missing_packages("TTS", "edge") == ()
-        assert deps.missing_packages("LLM", "claude_cli") == ()
+        assert deps.missing_packages("LLM", "pi") == ()
         has_funasr = importlib.machinery.PathFinder.find_spec("funasr") is not None
         assert deps.missing_packages("ASR", "fun_local") == (() if has_funasr else ("funasr",))
         assert deps.missing_packages("ASR", "no_such_provider") == ()  # 找不到源文件交给原项目报错

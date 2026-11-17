@@ -1,14 +1,15 @@
 """查天气（Open-Meteo + Nominatim）：报告格式、地名查询和缓存、本地所在地的顺序、后台设置和测试按钮。"""
 
 import asyncio
-import time
-from datetime import datetime
 from types import SimpleNamespace
 
 import httpx
 import pytest
+import requests
+from unittest.mock import Mock
 
 from core.admin import catalog, plugin_settings
+from core.utils import weather_places
 from plugins_func.functions import get_weather as gw
 
 NOW = "2026-11-07T21:00"
@@ -35,9 +36,10 @@ PLACE = gw.Place("深圳市（广东省）", 22.54, 114.05)
 
 
 @pytest.fixture(autouse=True)
-def clean_caches(monkeypatch):
+def clean_caches(monkeypatch, tmp_path):
     gw._places.clear()
     gw._reports.clear()
+    monkeypatch.setattr(weather_places, "PATH", tmp_path / "weather_places.json")  # 不读写 data/ 里的地名缓存
     monkeypatch.setattr(gw, "NOMINATIM_INTERVAL", 0)
 
 
@@ -57,7 +59,7 @@ def fake_api(monkeypatch):
         calls.append(request)
         return routes[request.url.host](request)
 
-    from httpx._client import AsyncClient as real  # tests/conftest.py 把 httpx.AsyncClient 换成了连不上的桩
+    real = httpx.AsyncClient
     monkeypatch.setattr(gw.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
     return SimpleNamespace(calls=calls, routes=routes)
 
@@ -161,6 +163,20 @@ def test_local_query_order(monkeypatch):
     assert gw.local_query(conn_with("深圳南山区", "杭州市", monkeypatch)) == "深圳南山区"
     assert gw.local_query(conn_with("", "杭州市", monkeypatch)) == "杭州市"
     assert gw.local_query(conn_with("", None, monkeypatch)) == "广州"
+
+
+@pytest.mark.parametrize('error', [requests.ConnectTimeout, requests.ReadTimeout])
+def test_ip_location_timeout_is_bounded_and_falls_back(monkeypatch, error):
+    from core.utils import util
+    from core.utils.cache.manager import cache_manager
+    monkeypatch.setattr(cache_manager, 'get', lambda *args: None)
+    get = Mock(side_effect=error('IP lookup timed out'))
+    monkeypatch.setattr(util.requests, 'get', get)
+    assert gw.local_query(conn_with()) == '广州'
+    get.assert_called_once()
+    connect_timeout, read_timeout = get.call_args.kwargs['timeout']
+    assert 0 < connect_timeout <= 2
+    assert 0 < read_timeout <= 3
 
 
 def test_get_weather_tool(fake_api, monkeypatch):

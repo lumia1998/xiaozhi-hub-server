@@ -44,7 +44,7 @@ def test_hotwords_truncated_to_limit():
 
 def test_initialize_asr_passes_shared_hotwords():
     config = {"selected_module": {"ASR": "DoubaoStreamASRV2"}, "ASR": {"DoubaoStreamASRV2": {**UPSTREAM, "api_key": "k"}},
-              "asr_hotwords": ["StackChan"], "call_names": {"models": {"ClaudeCLI": ["cloud"]}}}
+              "asr_hotwords": ["StackChan"], "call_names": {"models": {"ClaudeAPI": ["cloud"]}}}
     asr = initialize_asr(config)
     assert asr.hotwords == ["Claude", "StackChan"]  # 呼名的模型名在前
     assert asr.end_window_size == 200  # 没有 VAD 配置时用条目里的值

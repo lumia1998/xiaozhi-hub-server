@@ -9,14 +9,11 @@
 - 对话里这一轮的助手回复换成这段话；
 - 一个字都没播出（思考中打断）：这一轮整个从对话里去掉，提问也不留——用户喊唤醒词打断还没开口的回答，
   多半是说错了、识别错了或不想问了，留着没回答的提问，模型下一轮常会回头去答它；
-  这一轮已经执行过工具（比如调了音量）时例外，提问和工具记录都留着，回复记"……"，让模型知道发生过什么；
-  Claude Code、Grok Bot 也例外（提问留着、回复记"……"），它们被打断后还会在后台接着做。
+  这一轮已经执行过工具（比如调了音量）时例外，提问和工具记录都留着，回复记"……"，让模型知道发生过什么。
 
 打断时立刻改对话（新问题可能在旧的一轮结束前就发给模型了），chat() 结束（finish_turn）时再按同样的结果改一遍，
 收拾打断前已经写进去的部分；打断之后这一轮不再往对话里写回复（put），免得旧的一轮在新问题后面补上整段回复。
 只截当前这一代（turn_gen）的轮次：新问题已经开始、chat() 还没接手时来的打断，conn.sentence_id 还是上一轮的，不能去截它。
-
-只对经过对话记录的模型有效。Claude Code、Grok Bot 的上下文在它们自己的会话里，管不到。
 """
 
 import threading
@@ -113,9 +110,7 @@ def cut(conn, played_ms=None) -> None:
     heard, complete = heard_text(conn, played)
     if complete:
         return
-    # Claude Code、Grok Bot（有 AGENT_LABEL）的上下文在它们自己的会话里，被打断后还会在后台接着做、
-    # 做完进待汇报：这里的记录只用来显示，提问留着，回复记"……"
-    drop = not heard and not getattr(getattr(conn, "llm", None), "AGENT_LABEL", None)
+    drop = not heard
     heard = heard + CUT_MARK if heard else CUT_MARK
     if getattr(conn, "logger", None):
         conn.logger.bind(tag=__name__).info(

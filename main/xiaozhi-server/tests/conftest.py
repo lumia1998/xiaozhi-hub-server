@@ -143,7 +143,10 @@ def _init_service_noop(_config):
 
 import config.config_loader as _cl  # noqa: E402
 import config.manage_api_client as _mac  # noqa: E402
+import config.settings as _settings  # noqa: E402
 _cl.load_config = _load_config_patched
+# [xiaozhi-hub] data/.config.yaml 只在服务器上有；配置已由上面的 CONFIG 提供，跳过启动时的文件检查
+_settings.config_file_valid = True
 _mac.init_service = _init_service_noop
 _mac.get_server_config = _get_server_config_patched
 # 清空 ManageApiClient 单例，避免前面已经被其它代码触发过实例化。
@@ -223,7 +226,6 @@ _MOCKED_MODULES: tuple[str, ...] = (
     "elevenlabs",
     "mem0",
     "mem0ai",
-    "freezegun",
 )
 
 # 这些包即使装了也强制 shim — 它们要么本地模型链 import 时炸
@@ -325,35 +327,29 @@ def _install_mock_layer() -> None:
 
     asyncio.sleep = _fast_sleep  # type: ignore[assignment]
 
-    # 网络层 mock：如果真实 httpx 已加载，把它的 AsyncClient.send 替换成
-    # 立即抛 ConnectError 的桩，触发 ``_should_retry`` 走到 ``raise``，
-    # 但避免真发请求。Live 模式完全不安装这层。
+    # 网络层 mock：httpx 真正联网的默认传输层只放行本机（测试自己起的服务器），其他地址一律抛
+    # ConnectError，不发请求。客户端类不换：测试注入的 httpx.MockTransport 照常工作。
+    # Live 模式完全不安装这层。
     if not LIVE_API_TESTS:
         try:
-            import httpx as _httpx  # noqa: F401
+            import httpx as _httpx
 
-            class _FakeAsyncClient:
-                def __init__(self, *args, **kwargs):
-                    pass
+            _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+            _handle = _httpx.HTTPTransport.handle_request
+            _handle_async = _httpx.AsyncHTTPTransport.handle_async_request
 
-                async def send(self, *args, **kwargs):
-                    raise _httpx.ConnectError("MOCK: connect refused")
+            def _local_only(self, request):
+                if request.url.host not in _LOOPBACK:
+                    raise _httpx.ConnectError("MOCK: connect refused", request=request)
+                return _handle(self, request)
 
-                async def aclose(self):
-                    return None
+            async def _local_only_async(self, request):
+                if request.url.host not in _LOOPBACK:
+                    raise _httpx.ConnectError("MOCK: connect refused", request=request)
+                return await _handle_async(self, request)
 
-            class _FakeClient:
-                def __init__(self, *args, **kwargs):
-                    pass
-
-                def send(self, *args, **kwargs):
-                    raise _httpx.ConnectError("MOCK: connect refused")
-
-                def close(self):
-                    return None
-
-            _httpx.AsyncClient = _FakeAsyncClient  # type: ignore[misc]
-            _httpx.Client = _FakeClient  # type: ignore[misc]
+            _httpx.HTTPTransport.handle_request = _local_only  # type: ignore[method-assign]
+            _httpx.AsyncHTTPTransport.handle_async_request = _local_only_async  # type: ignore[method-assign]
         except ImportError:
             pass
 
@@ -448,7 +444,7 @@ def pytest_collection_modifyitems(config, items):
 
 
 # [xiaozhi-hub] 测试期间不往控制台打 loguru 日志，只写 pytest.log。
-# claude_cli 等模块在后台线程里打日志；pytest 在每个测试阶段之间会截取并清空捕获的输出，
+# 有些模块在后台线程里打日志（如总结聊天记录）；pytest 在每个测试阶段之间会截取并清空捕获的输出，
 # 机器负载高时，一条日志刚好在这时被截断在一个汉字中间，pytest 共用的解码器从此出错，
 # 之后所有测试都报 UnicodeDecodeError（表现为"1 failed, 99 passed, 215 errors"）。没有测试检查控制台日志。
 @pytest.fixture(autouse=True, scope="session")

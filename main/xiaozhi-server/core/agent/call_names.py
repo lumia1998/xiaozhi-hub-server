@@ -1,12 +1,10 @@
-"""呼名：句首"嗨 + 称呼"（如"嗨 Claude"）指定由哪个模型回答。
+"""呼名：句首"嗨 + 称呼"（如"嗨 DeepSeek"）指定由哪个模型回答。
 
-称呼对应 LLM 配置里的条目（如 ClaudeCLI、DeepSeekLLM），叫到后这台设备就切到这个模型并记住，
-之后直接说话也交给它（见 llm_router）。称呼在交给模型前去掉；整句话只有称呼时，回一句固定的话，
-不发给模型，也不启动 Claude Code 进程，这样下一句"接着上次聊"仍然是这个模型的第一句话，照常接续。
+称呼对应 LLM 配置里的条目（如 DeepSeekLLM），叫到后这台设备就切到这个模型并记住，
+之后直接说话也交给它（见 llm_router）。称呼在交给模型前去掉；整句话只有称呼时，回一句固定的话，不发给模型。
 
-默认别名来自实测（工作空间 asr-test/call-names）：语音识别把 Claude 全部识别成 "cloud"，
-把"嗨"识别成 嗨/嘿/hi/hey/high/hiigh。别名也可以在管理后台管理：开启"录入"后对着设备说几遍，
-把语音识别实际听到的结果存成别名（Learner）。
+实测（工作空间 asr-test/call-names）语音识别会把"嗨"识别成 嗨/嘿/hi/hey/high/hiigh，都算招呼语。
+别名在管理后台管理：开启"录入"后对着设备说几遍，把语音识别实际听到的结果存成别名（Learner）。
 """
 
 import asyncio
@@ -26,7 +24,6 @@ if TYPE_CHECKING:
 
 TAG = __name__
 
-DEFAULT_MODELS = {"ClaudeCLI": ["claude", "cloud", "clod", "clot", "克劳德"]}
 DEFAULT_REPLY = "我在"
 # 发缓存的音频前等一会儿：设备收到 tts start 后要先切到说话状态（会清空解码队列），切换完成前收到的音频会被丢掉。
 # 正常合成时中间有约 2 秒的合成时间，不会碰到；缓存的音频紧跟着就到，不等的话设备只显示文字、没有声音。
@@ -75,7 +72,7 @@ def match_call_name(text: str, models: dict = None):
 
     连说两遍称呼（实测出现过 "Hi, cloud. Hi, cloud."）也一并去掉。
     """
-    patterns = _build(models or DEFAULT_MODELS)
+    patterns = _build(models or {})
     found = None
     rest = text or ""
     while True:
@@ -154,10 +151,11 @@ _filling = {}  # 正在合成的：key -> Task
 _cache_dir = Path(get_project_dir()) / "data" / "call_reply_audio"
 
 
-def _cache_key(conn: "ConnectionHandler", text: str):
+def _cache_key(conn: "ConnectionHandler", text: str, tts=None):
     # 存盘后后台改了音色、语速、音量（含 post_gain）都要重新合成，所以这些都算进来
-    tts = conn.tts
-    return (type(tts).__name__, getattr(tts, "voice", None), getattr(tts, "speech_rate", None),
+    tts = tts if tts is not None else conn.tts
+    return ("v2", type(tts).__module__, type(tts).__name__, getattr(tts, "cache_identity", None),
+            getattr(tts, "voice", None), getattr(tts, "speech_rate", None),
             getattr(tts, "volume", None), getattr(tts, "pitch_rate", None), getattr(tts, "post_gain", None),
             getattr(conn, "sample_rate", None), text)
 
@@ -178,6 +176,8 @@ def _load_cached(key):
     packets, i = [], 0
     while i + 4 <= len(data):
         (n,) = struct.unpack_from(">I", data, i)
+        if n == 0 or i + 4 + n > len(data):
+            return None
         packets.append(data[i + 4:i + 4 + n])
         i += 4 + n
     if i != len(data) or not packets:
@@ -194,14 +194,21 @@ def _save_cached(key, packets) -> None:
     tmp.replace(path)
 
 
-async def _fill_cache(conn: "ConnectionHandler", text: str) -> None:
-    key = _cache_key(conn, text)
+async def _fill_cache(conn: "ConnectionHandler", text: str, tts=None) -> None:
+    tts = tts if tts is not None else conn.tts
+    key = _cache_key(conn, text, tts)
     if key in _filling:
         return await asyncio.shield(_filling[key])
 
     async def fill():
         try:
-            packets = await asyncio.to_thread(conn.tts.to_tts, text)
+            packets = await asyncio.to_thread(tts.to_tts, text)
+            if isinstance(packets, (str, Path)):
+                from core.utils.util import audio_to_data_stream
+
+                path, packets = str(packets), []
+                await asyncio.to_thread(audio_to_data_stream, path, True, packets.append,
+                                        conn.sample_rate)
             if packets:
                 _audio_cache[key] = packets
                 await asyncio.to_thread(_save_cached, key, packets)
@@ -214,6 +221,17 @@ async def _fill_cache(conn: "ConnectionHandler", text: str) -> None:
     await asyncio.shield(_filling[key])
 
 
+async def cached_reply(conn: "ConnectionHandler", text: str, timeout: float = 8):
+    """按当前完整 TTS 身份取音频；冷缓存只合成一次，超时后不播放迟到结果。"""
+    tts = conn.tts
+    key = _cache_key(conn, text, tts)
+    packets = _load_cached(key)
+    if packets is None:
+        await asyncio.wait_for(_fill_cache(conn, text, tts), timeout=timeout)
+        packets = _load_cached(key)
+    return packets
+
+
 def reply_text(cfg: dict) -> str:
     """只喊称呼时回的话。"""
     return one_segment((cfg or {}).get("reply") or "") or DEFAULT_REPLY
@@ -223,7 +241,9 @@ async def warm_up(conn: "ConnectionHandler") -> None:
     """连接建立后在后台准备好只喊称呼时的回复：磁盘上有就读进内存，没有就等语音合成就绪后合成一次。
     第一次只喊称呼时就不用现合成了（网关重启后的第一次也一样）。"""
     cfg = conn.config.get("call_names") or {}
-    if not cfg.get("enabled", True):
+    wake_enabled = (conn.config.get("enable_greeting", True)
+                    and conn.config.get("enable_wakeup_words_response_cache", True))
+    if not cfg.get("enabled", True) and not wake_enabled:
         return
     deadline = time.monotonic() + 30
     while not conn.tts and time.monotonic() < deadline:
@@ -308,13 +328,12 @@ async def handle_call_name(conn: "ConnectionHandler", text: str):
     cfg = conn.config.get("call_names") or {}
     if not cfg.get("enabled", True):
         return text
-    hit = match_call_name(text, cfg.get("models") or DEFAULT_MODELS)
+    hit = match_call_name(text, cfg.get("models") or {})
     if hit is None:
         return text
     from core.agent import llm_router
 
     model, rest = hit
-    model = llm_router.entry_name(model)
     try:
         ok = await llm_router.switch_async(conn, model)
     except Exception as e:
@@ -330,25 +349,8 @@ async def handle_call_name(conn: "ConnectionHandler", text: str):
         return rest
 
     reply = reply_text(cfg)
-    # 切回一个在外面干活的 Bot（Grok Bot）：它做完的活还没念过的，跟在"我在"后面一起念
-    bot_id, pending = _pending_report(conn, model)
-    if pending:
-        reply = f"{reply}。{pending}"
-    if not await _speak(conn, text, reply, cache=not pending):
+    if not await _speak(conn, text, reply, cache=True):
         conn.logger.bind(tag=TAG).warning("呼名：TTS 尚未就绪，无法回复，按普通对话处理")
-        if pending:
-            from core.agent import reports
-
-            reports.add(reports.device_key(conn), bot_id, pending)  # 没念成，放回去下次念
         return text
     conn.logger.bind(tag=TAG).info(f"呼名 {model}：只有称呼，直接回复：{reply[:60]}")
     return None
-
-
-def _pending_report(conn: "ConnectionHandler", model: str):
-    """这个模型是 Grok Bot 且有做完还没念的活：返回 (bot_id, 要念的话)；否则 ("", "")。"""
-    from core.agent import llm_router, reports
-
-    entry = (llm_router._server_config(conn).get("LLM") or {}).get(model) or {}
-    bot_id = str(entry.get("bot_id") or "").strip() if isinstance(entry, dict) else ""
-    return bot_id, (reports.take_text(reports.device_key(conn), bot_id) if bot_id else "")

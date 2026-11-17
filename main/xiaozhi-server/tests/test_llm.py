@@ -1,19 +1,13 @@
-"""LLM 链路测试。
+"""LLM 链路测试，只在 Live 模式（``RUN_LIVE_API_TESTS=1``）跑：调真实模型。
 
-Mock 模式（默认）：从 data/.config.yaml 拿配置构造真实 provider，
-网络调用走 conftest 注入的 shim —— 不发任何请求。
-Live 模式（``RUN_LIVE_API_TESTS=1``）：调真实 LLM provider，参考
-``performance_tester_llm.py`` 的 ThreadPoolExecutor + 10s 超时模式。
+大模型都经 Pi 引擎，请求由它的 Node 子进程发出，conftest 在 httpx 传输层装的断网拦不住，
+默认模式下跑也会真的请求模型，所以默认整个文件跳过。
 
 接口约定（core/providers/llm/base.py）：
     response(session_id, dialogue) -> Iterator[str]，同步流式生成器
     response_no_stream(system_prompt, user_content) -> str
 
-特殊处理：
-- CozeLLM 看 bot_id / user_id 而非 api_key
-- Ollama 要 model_name + 本地服务可用
-- placeholder 检测（"你的" / "placeholder" / "xxx" / "sk-xxx"）
-- 因为 LLM 是同步 generator，不能直接 asyncio.wait_for → 线程池
+LLM 是同步 generator，不能直接 asyncio.wait_for，放进线程池加超时。
 """
 from __future__ import annotations
 
@@ -24,13 +18,15 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import (
-    CONFIG,
     LIVE_API_TESTS,
     get_provider_config,
     get_provider_type,
     get_selected_provider_name,
     has_real_key,
 )
+
+if not LIVE_API_TESTS:
+    pytest.skip("Pi 经 Node 发请求，conftest 拦不住：只在 RUN_LIVE_API_TESTS=1 时跑", allow_module_level=True)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -42,26 +38,9 @@ def _build_provider():
     cfg = get_provider_config("LLM", name)
     if not cfg:
         pytest.skip(f"LLM provider '{name}' 配置缺失")
-
-    # 任何模式下：key 是占位符 → skip。真请求需要真 key；mock 模式下
-    # 没有真 key 跑下去也会撞真 SDK 的网络栈（openai/edge_tts）报错。
-    if name == "CozeLLM":
-        if any(x in cfg.get("bot_id", "") for x in ["你的"]) or any(
-            x in cfg.get("user_id", "") for x in ["你的"]
-        ):
-            pytest.skip("LLM 'CozeLLM' 的 bot_id/user_id 未配置")
-    elif name == "Ollama":
-        if not cfg.get("model_name"):
-            pytest.skip("LLM 'Ollama' 的 model_name 未配置")
-    elif not has_real_key(cfg, "api_key"):
-        if LIVE_API_TESTS:
-            pytest.skip(f"LLM '{name}' 的 api_key 未配置")
-        else:
-            pytest.skip(
-                f"LLM '{name}' 的 api_key 是占位符（mock 模式不会真发请求）。"
-                "真请求模式：export RUN_LIVE_API_TESTS=1 并填真 key 后再跑。"
-            )
-
+    # 模型服务的条目，Key 在 model_services 里
+    if not cfg.get("service_id") and not has_real_key(cfg, "api_key"):
+        pytest.skip(f"LLM '{name}' 的 api_key 未配置")
     ptype = get_provider_type("LLM", name)
     if not ptype:
         pytest.skip(f"LLM '{name}' 的 type 字段缺失")

@@ -10,7 +10,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from core.admin import admin_handler as ah
-from core.admin import config_store, connections, pages, plugin_settings
+from core.admin import config_store, pages, plugin_settings
 from plugins_func.functions import web_search as ws
 
 OK_BODY = {
@@ -41,7 +41,7 @@ def fake_api(monkeypatch):
         calls.append(request)
         return state["respond"](request)
 
-    from httpx._client import AsyncClient as real  # tests/conftest.py 把 httpx.AsyncClient 换成了连不上的桩
+    real = httpx.AsyncClient
     monkeypatch.setattr(ws.httpx, "AsyncClient",
                         lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
     return SimpleNamespace(calls=calls, state=state)
@@ -206,7 +206,7 @@ async def test_key_redacted_in_error(fake_api):
 
 CUSTOM_YAML = """\
 selected_module:
-  LLM: ClaudeCLI
+  LLM: ClaudeAPI
   Intent: nointent
 plugins:
   web_search:
@@ -234,7 +234,7 @@ def test_web_search_needs_config_until_key(cfg_path):
 @pytest.fixture
 async def client(cfg_path):
     app = web.Application()
-    config = {"selected_module": {"LLM": "ClaudeCLI", "Intent": "nointent"}, "LLM": {}, "Intent": {}}
+    config = {"selected_module": {"LLM": "ClaudeAPI", "Intent": "nointent"}, "LLM": {}, "Intent": {}}
     handler = ah.AdminHandler(config, ws_server=None, config_path=cfg_path)
     handler.register(app)
     async with TestClient(TestServer(app)) as c:
@@ -261,37 +261,29 @@ async def test_admin_test_button(client, fake_api):
 def _status(merged):
     from core.admin import status
 
-    llm = (merged.get("selected_module") or {}).get("LLM")
-    return status._plugin_setting_checks(merged, config_store.entry_type(merged, "LLM", llm) if llm else None)
+    return status._plugin_setting_checks(merged)
 
 
-def _merged(llm_type, intent, functions, key="", api_intent=None):
-    m = {"selected_module": {"LLM": "M", "Intent": intent}, "LLM": {"M": {"type": llm_type}},
-         "Intent": {intent: {"type": intent}, "function_call": {"type": "function_call", "functions": functions}},
-         "plugins": {"web_search": {"api_key": key}}}
-    if api_intent:
-        m["admin"] = {"api_intent": api_intent}
-    return m
+def _merged(intent, functions, key=""):
+    return {"selected_module": {"Intent": intent},
+            "Intent": {intent: {"type": intent}, "function_call": {"type": "function_call", "functions": functions}},
+            "plugins": {"web_search": {"api_key": key}}}
 
 
 def test_status_warns_only_when_plugins_used():
     on = ["web_search", "get_weather"]
-    warn = _status(_merged("openai", "function_call", on))
+    warn = _status(_merged("function_call", on))
     assert len(warn) == 1 and warn[0]["level"] == "warn" and "联网搜索" in warn[0]["detail"]
-    assert _status(_merged("openai", "function_call", on, key="sk-x")) == []          # 填了 Key
-    assert _status(_merged("openai", "function_call", ["get_weather"])) == []          # 没勾
-    assert _status(_merged("openai", "nointent", on)) == []                            # API 模型不用插件
-    # 默认是智能体：自己不用插件；设备切到 API 模型时会用（没选过默认用插件），选过「不用插件」就不提醒
-    assert len(_status(_merged("claude_cli", "nointent", on))) == 1
-    assert len(_status(_merged("grok_bot", "nointent", on, api_intent="function_call"))) == 1
-    assert _status(_merged("claude_cli", "nointent", on, api_intent="nointent")) == []
+    assert _status(_merged("function_call", on, key="sk-x")) == []  # 填了 Key
+    assert _status(_merged("function_call", ["get_weather"])) == []  # 没勾
+    assert _status(_merged("nointent", on)) == []                    # 不用插件
 
 
 # ---------- 升级：配置里还留着旧版（秘塔等）的设置 ----------
 
 LEGACY_YAML = """\
 selected_module:
-  LLM: ClaudeCLI
+  LLM: ClaudeAPI
   Intent: nointent
 plugins:
   web_search:
@@ -332,7 +324,7 @@ async def test_total_timeout(fake_api, monkeypatch):
     async def slow_handler(request):
         await aio.get_running_loop().run_in_executor(None, __import__("time").sleep, 0.3)
         return httpx.Response(200, json=OK_BODY)
-    from httpx._client import AsyncClient as real
+    from httpx._client import AsyncClient as real  # fake_api 已经把 httpx.AsyncClient 换掉了
     monkeypatch.setattr(ws.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(slow_handler), **kw))
     with pytest.raises(ws.SearchError, match="没有结果") as e:
         await ws.search(SETTINGS, "q")

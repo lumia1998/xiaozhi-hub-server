@@ -13,6 +13,7 @@ from jinja2 import Template
 
 from config.config_loader import get_project_dir
 from core.admin import catalog, connections, pages
+from core.agent import chat_history
 
 # 变量标记：\x01变量名\x02值\x03，前端换成高亮
 MARK_START, MARK_SEP, MARK_END = "\x01", "\x02", "\x03"
@@ -27,23 +28,6 @@ VAR_LABELS = {
     "dynamic_context": "动态上下文",
     "language": "回复语言",
 }
-
-def _fewshot_text() -> str:
-    """和 connection._inject_tool_call_fewshot 注入的示例一致，按 dialogue.render_fewshot 写进系统提示的样子。"""
-    from core.utils.dialogue import Message, render_fewshot
-
-    def call(name, args):
-        return Message(role="assistant", tool_calls=[{"function": {"name": name, "arguments": args}}])
-
-    return render_fewshot([
-        Message(role="user", content="给我讲个故事吧"),
-        call("direct_answer", '{"response": "好呀，你想听什么类型的呀？童话、冒险还是搞笑的？选一个我给你开讲~"}'),
-        Message(role="tool", content="已直接回复"),
-        Message(role="user", content="拜拜"),
-        call("handle_exit_intent", '{"say_goodbye": "再见，下次再聊~"}'),
-        Message(role="tool", content="退出意图已处理"),
-        Message(role="assistant", content="再见，下次再聊~"),
-    ])
 
 
 def _mark(name: str, value) -> str:
@@ -83,8 +67,6 @@ def _voice_name(voice: str) -> str:
 
 
 def _llm_label(name: str, entry: dict) -> str:
-    if entry.get("type") == "claude_cli":
-        return "Claude Code"
     vendor = catalog.VENDOR_BY_ENTRY.get(name)
     return vendor["label"] if vendor else name
 
@@ -100,16 +82,6 @@ def _asr_label(name: str, entry: dict) -> str:
     return name or "未设置"
 
 
-def _claude_model_label(model) -> str:
-    option = next((o for o in catalog.CLAUDE_MODELS if o["value"] == model), None)
-    return option["label"] if option else (str(model) if model else "默认模型")
-
-
-def _effort_label(effort) -> str:
-    option = next((o for o in catalog.CLAUDE_EFFORTS if o["value"] == effort), None)
-    return option["label"] if option else "默认"
-
-
 def describe_stages(merged: dict) -> list:
     """一句话经过的五步：每步只给当前用的模块和一个关键设置，点击跳到对应的设置页（page 为 None 表示后台没有设置页）。"""
     _, vad = _entry(merged, "VAD")
@@ -119,12 +91,8 @@ def describe_stages(merged: dict) -> list:
     silence = vad.get("min_silence_duration_ms", 1000)
     prebuffer = int(merged.get("tts_audio_prebuffer_count") or 5)
 
-    if llm.get("type") == "claude_cli":
-        llm_value = f"Claude Code · {_claude_model_label(llm.get('model'))}"
-        llm_hint = f"思考力度：{_effort_label(llm.get('effort'))}"
-    else:
-        llm_value = _llm_label(llm_name, llm)
-        llm_hint = str(llm.get("model_name") or "")
+    llm_value = _llm_label(llm_name, llm)
+    llm_hint = str(llm.get("model_name") or "")
     if tts.get("type") == "edge":
         tts_value, tts_hint = f"EdgeTTS · {_voice_name(str(tts.get('voice') or ''))}", "微软在线语音，需要联网"
     else:
@@ -153,13 +121,6 @@ def _duration(seconds) -> str:
     return f"{int(seconds)} 秒"
 
 
-def _setting(entry: dict, key: str, default: float) -> float:
-    """和 claude_cli 读配置的规则一样：没填（None 或空字符串）用默认值，填 0 就是 0。"""
-    from core.providers.llm.claude_cli.claude_cli import _num
-
-    return _num(entry, key, default)
-
-
 def _quoted(words, sep: str = "") -> str:
     return sep.join(f"“{w}”" for w in words)
 
@@ -169,10 +130,7 @@ def describe_tips(merged: dict) -> list:
     calls = pages.describe_call_names(merged)
     llms = merged.get("LLM") or {}
     default_name = (merged.get("selected_module") or {}).get("LLM")
-    called = [m["entry"] for m in calls["models"]] if calls["enabled"] else []
-    names = [default_name, *called]
-    cli = next((llms[n] for n in names if isinstance(llms.get(n), dict) and llms[n].get("type") == "claude_cli"), None)
-    has_api = any(isinstance(llms.get(n), dict) and llms[n].get("type") != "claude_cli" for n in names)
+    history = chat_history.settings(merged)
 
     tips = [{"title": "唤醒", "say": "说唤醒词（StackChan 是“Hi, StackChan”），或按一下按键、点一下屏幕",
              "result": "设备开始听你说话。交给这台设备上次用的模型，第一次用时是 "
@@ -184,25 +142,13 @@ def describe_tips(merged: dict) -> list:
                                + (f"现在的称呼 —— {aliases}" if aliases else "还没有配置称呼")})
     tips.append({"title": "打断", "say": "设备说话时按一下按键（StackChan 是点一下屏幕上的脸），或者喊唤醒词",
                  "result": "马上停下，然后可以说下一句。设备说话时不收音，不能直接插话"})
-    if cli:
-        progress = _setting(cli, "progress_interval_seconds", 30)
-        turn = _setting(cli, "turn_timeout_seconds", 600)
-        tips.append({"title": "长任务", "say": "让 Claude 做要几分钟的事",
-                     "result": ("设备陪着等，不限时长" if not turn else f"设备陪着等，最长 {_duration(turn)}")
-                               + (f"；{_duration(progress)}没开口就提示一次进度" if progress else "")
-                               + ("。中途打断、结束或等满了，Claude 不停，后台接着做，做完了告诉你；想让它停下就说“停下”"
-                                  if _setting(cli, "background_max_seconds", 7200) else "。被停下或打断后，说“继续”接着做")})
-        window = _setting(cli, "resume_window_minutes", 120)
-        keywords = cli.get("resume_keywords") or ["接着上次聊"]
-        said = _quoted(keywords[:2], "或")
-        result = (f"{_duration(window * 60)}内再唤醒，Claude 自动接上上次的对话；隔得更久的，说{said}也能接上"
-                  if window else f"说{said}接上上次的对话")
-        if has_api:
-            result += "。API 模型断开后就不记得了"
-        tips.append({"title": "接着上次聊", "say": "过一会儿再唤醒设备", "result": result})
-    elif has_api:
-        tips.append({"title": "接着上次聊", "say": "过一会儿再唤醒设备",
-                     "result": "API 模型只记得这次连接里的对话，断开后从头开始"})
+    if history["enabled"]:
+        result = f"每个模型接着这台设备最近 {history['max_messages']} 条记录聊，断开、重启后也记得"
+        if history["summary"] and history["use_memory"]:
+            result += "；更早的对话总结成记忆，所有模型共用"
+    else:
+        result = "只记得这次连接里的对话，断开后从头开始"
+    tips.append({"title": "接着上次聊", "say": "过一会儿再唤醒设备", "result": result})
 
     first = int(merged.get("close_connection_no_voice_time", 120) or 120)
     end_prompt = merged.get("end_prompt") or {}
@@ -268,74 +214,44 @@ def render_base_prompt(merged: dict) -> str:
 def describe_prompt(merged: dict) -> dict:
     llm_name, llm = _entry(merged, "LLM")
     _, intent = _entry(merged, "Intent")
-    is_cli = llm.get("type") == "claude_cli"
     conn = _online_conn()
     base = render_base_prompt(merged)
 
+    history = chat_history.settings(merged)
+    if history["enabled"]:
+        history_note = (f"每轮带上这台设备和这个模型最近 {history['max_messages']} 条记录（约 {history['max_tokens']} token 以内），"
+                        "设备断开、网关重启后从 data/chat.db 载入；工具调用和它的结果不拆开。")
+        if history["summary"]:
+            history_note += ("更早的对话在后台总结成记忆，放进系统提示的 <memory>。" if history["use_memory"]
+                             else "更早的对话在后台总结成记忆，目前没有放进提示词。")
+    else:
+        history_note = "每轮把这次连接以来的对话一起发送；聊天记录不落盘，设备断开后清空。"
+
     segments = []
-    if is_cli:
-        segments.append({
-            "id": "claude_preset", "title": "Claude Code 自带的系统提示", "source": "Claude Code", "when": "进程启动时",
-            "text": "", "collapsed": True,
-            "note": "Claude Code 内置的说明，介绍它自己有哪些工具、工作目录在哪、怎么回答编程问题等。"
-                    "这段由 Claude Code 程序自己生成，不在我们的配置里，这里无法显示原文。我们的内容追加在它后面。",
-        })
     segments.append({
-        "id": "base", "title": "基础模板（含人设）", "source": "服务端", "when":
-            "设备连接时生成；Claude 进程启动时固定" if is_cli else "设备连接时生成；当前时间每轮更新",
+        "id": "base", "title": "基础模板（含人设）", "source": "服务端", "when": "设备连接时生成；当前时间每轮更新",
         "text": base, "collapsed": False,
         "note": f"来自 {_template_name(merged)}。高亮的部分是填进去的值：人设来自配置里的 prompt，"
-                "日期、农历在设备连接时生成，当前时间" +
-                ("在 Claude 进程启动时取一次。" if is_cli else "每轮发送前更新。"),
+                "日期、农历在设备连接时生成，当前时间每轮发送前更新。",
     })
-    if is_cli:
-        from core.providers.llm.claude_cli.claude_cli import VOICE_RULES
-
+    if intent.get("type") == "function_call":
+        plugins = [p["label"] for p in catalog.PLUGINS if p["name"] in (intent.get("functions") or [])]
         segments.append({
-            "id": "voice_rules", "title": "语音规则", "source": "服务端", "when": "进程启动时",
-            "text": VOICE_RULES.strip(), "collapsed": False,
-            "note": "我们为 Claude Code 加的规则：开头一个 emoji、简短口语、不用 Markdown。写在 claude_cli.py 的 VOICE_RULES。",
+            "id": "tools", "title": "工具清单", "source": "服务端", "when": "每轮",
+            "text": "、".join([p["label"] for p in catalog.ALWAYS_ON_PLUGINS] + plugins),
+            "collapsed": False,
+            "note": "随请求一起发给模型的工具，每个工具带名字、用途和参数说明。",
         })
-        segments.append({
-            "id": "turn", "title": "每轮发送的内容", "source": "服务端", "when": "每轮",
-            "text": "（这一轮识别出的文字，例如：帮我看看工作目录里有哪些文件）", "collapsed": False,
-            "note": "只发这一轮的话，之前的对话保存在 Claude Code 会话里。第一次识别到说话人时，会发 "
-                    "{\"speaker\": \"名字\", \"content\": \"文字\"} 这样的 JSON（声纹识别目前没开）。",
-        })
-    else:
-        if intent.get("type") == "function_call":
-            segments.append({
-                "id": "fewshot", "title": "工具调用示例", "source": "服务端", "when": "每轮",
-                "text": _fewshot_text(), "collapsed": True,
-                "note": "追加在系统提示词末尾的一段示例，教模型什么时候直接回答、什么时候调用工具。不会显示给用户。"
-                        "原项目把它们当成几轮对话发，模型会当成用户真说过（问「我刚才让你做过什么」答「讲故事、说拜拜」），"
-                        "所以改成写在系统提示里并注明不是真实对话。",
-            })
-            plugins = [p["label"] for p in catalog.PLUGINS if p["name"] in (intent.get("functions") or [])]
-            segments.append({
-                "id": "tools", "title": "工具清单", "source": "服务端", "when": "每轮",
-                "text": "、".join(["直接回答（direct_answer）", *[p["label"] for p in catalog.ALWAYS_ON_PLUGINS], *plugins]),
-                "collapsed": False,
-                "note": "随请求一起发给模型的工具（OpenAI 协议的 tools 参数），每个工具带名字、用途和参数说明。",
-            })
-        segments.append({
-            "id": "history", "title": "历史对话 + 这一轮的话", "source": "服务端", "when": "每轮",
-            "text": "[user] 上一轮说的话\n[assistant] 上一轮的回复\n……\n[user] 这一轮识别出的文字", "collapsed": False,
-            "note": "每轮都把这次连接以来的全部对话一起发送，没有截断；设备断开后清空（没有开启记忆）。",
-        })
-
-    warnings = []
-    if is_cli:
-        idle = _setting(llm, "idle_timeout_seconds", 300)
-        if idle:  # 填 0 时每轮结束就关进程，下一轮重新传入，日期时间总是新的
-            warnings.append(f"提示词在 Claude Code 进程启动时一次性传入，进程存活期间（空闲 {_duration(idle)}才关闭）"
-                            "里面的日期、时间不会更新。")
+    segments.append({
+        "id": "history", "title": "历史对话 + 这一轮的话", "source": "服务端", "when": "每轮",
+        "text": "[user] 上一轮说的话\n[assistant] 上一轮的回复\n……\n[user] 这一轮识别出的文字", "collapsed": False,
+        "note": history_note,
+    })
 
     actual = _system_prompt_of(conn) if conn is not None else ""
     return {
         "llm": _llm_label(llm_name, llm),
         "segments": segments,
-        "warnings": warnings,
         "actual": {"device_id": getattr(conn, "device_id", None), "text": actual} if actual else None,
         "marks": {"start": MARK_START, "sep": MARK_SEP, "end": MARK_END},
         "var_labels": VAR_LABELS,

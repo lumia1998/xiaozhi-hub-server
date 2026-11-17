@@ -41,12 +41,10 @@ def test_correct_and_record_text_and_dict():
 
 
 def test_call_name_hotwords_use_model_names_not_aliases():
-    cfg = {"call_names": {"models": {"ClaudeCLI": ["cloud"], "DeepSeekLLM": ["深度"], "ChatGLMLLM": ["智谱"]}}}
+    cfg = {"call_names": {"models": {"ClaudeAPI": ["cloud"], "DeepSeekLLM": ["深度"], "ChatGLMLLM": ["智谱"]}}}
     assert asr_text.call_name_hotwords(cfg) == ["Claude", "DeepSeek", "智谱"]
-    assert asr_text.call_name_hotwords({}) == ["Claude"]  # 没配时用默认呼名
-    assert asr_text.call_name_hotwords({"call_names": {"enabled": False}}) == []
-    both = {"call_names": {"models": {"ClaudeCLI": ["cloud"], "ClaudeAPI": ["claude api"]}}}
-    assert asr_text.call_name_hotwords(both) == ["Claude"]  # 本机和 API 都叫 Claude，只留一个
+    assert asr_text.call_name_hotwords({}) == []  # 没配称呼
+    assert asr_text.call_name_hotwords({"call_names": {**cfg["call_names"], "enabled": False}}) == []
 
 
 XASR = {"type": "sherpa_onnx_local", "model_type": "transducer"}
@@ -72,10 +70,10 @@ def test_hotwords_of_shared_legacy_default():
 
 
 def test_effective_hotwords_merge_dedupe():
-    cfg = {"asr_hotwords": ["claude", "GitHub"]}
+    cfg = {"asr_hotwords": ["claude", "GitHub"], "call_names": {"models": {"ClaudeAPI": ["cloud"]}}}
     assert asr_text.effective_hotwords(XASR, cfg) == ["claude", "GitHub"]  # Claude 已有（不分大小写）
     # 呼名带入的放在前面，豆包截断时优先保住
-    assert asr_text.effective_hotwords(DOUBAO, {"asr_hotwords": ["GitHub"]}) == ["Claude", "GitHub"]
+    assert asr_text.effective_hotwords(DOUBAO, {**cfg, "asr_hotwords": ["GitHub"]}) == ["Claude", "GitHub"]
     assert asr_text.effective_hotwords({"type": "fun_local"}, cfg) == []  # 条目不支持热词
 
 

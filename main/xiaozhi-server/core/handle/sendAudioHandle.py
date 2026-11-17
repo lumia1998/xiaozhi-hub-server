@@ -344,6 +344,11 @@ async def send_tts_message(conn: "ConnectionHandler", state, text=None):
         if hasattr(conn, "audio_rate_controller") and conn.audio_rate_controller:
             conn.audio_rate_controller.stop_sending()
         conn.clearSpeakStatus()
+        try:
+            from core.agent.task_delivery import complete_delivery
+            complete_delivery(conn)
+        except Exception as exc:
+            conn.logger.bind(tag=TAG).warning(f"后台任务结果状态更新失败: {type(exc).__name__}")
 
     # 发送消息到客户端
     await conn.websocket.send(json.dumps(message))

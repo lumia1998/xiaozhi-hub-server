@@ -15,11 +15,6 @@ def test_message_preserves_explicit_uniq_id():
     assert m.uniq_id == "abc"
 
 
-def test_message_default_is_not_temporary():
-    m = Message(role="user", content="hi")
-    assert m.is_temporary is False
-
-
 def test_message_tool_call_id_default_is_none():
     m = Message(role="user", content="hi")
     assert m.tool_call_id is None
@@ -70,14 +65,3 @@ async def test_get_llm_dialogue_with_memory_substitutes_into_system_message():
     system = next(m for m in msgs if m["role"] == "system")
     assert "user likes cats" in system["content"]
     assert "<memory></memory>" not in system["content"]
-
-
-@pytest.mark.asyncio
-async def test_get_llm_dialogue_puts_temporary_few_shot_into_system_prompt():
-    d = Dialogue()
-    d.put(Message(role="system", content="sys"))
-    d.put(Message(role="user", content="real user msg", is_temporary=False))
-    d.put(Message(role="user", content="fewshot example", is_temporary=True))
-    msgs = d.get_llm_dialogue()
-    assert [m["content"] for m in msgs if m["role"] == "user"] == ["real user msg"]
-    assert "用户：fewshot example" in msgs[0]["content"]

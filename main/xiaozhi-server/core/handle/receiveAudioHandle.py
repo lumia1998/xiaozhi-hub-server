@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from core.connection import ConnectionHandler
 from core.utils.util import audio_to_data
-from core.agent import clear_command
+from core.agent import clear_command, pre_llm
 from core.agent.call_names import handle_call_name
 from core.handle.abortHandle import handleAbortMessage
 from core.handle.intentHandler import handle_user_intent, speak_txt
@@ -110,7 +110,7 @@ async def startToChat(conn: "ConnectionHandler", text, gen=None):
     # 期间设备打断了就不再回答
     gen = turn_gen.bump(conn)
 
-    # [xiaozhi-hub] 呼名：句首"嗨 Claude"先去掉称呼；只有称呼时直接回复，不发给模型
+    # [xiaozhi-hub] 呼名：句首"嗨 DeepSeek"先去掉称呼；只有称呼时直接回复，不发给模型
     actual_text = await handle_call_name(conn, actual_text)
     if actual_text is None:
         return
@@ -118,6 +118,10 @@ async def startToChat(conn: "ConnectionHandler", text, gen=None):
     # [xiaozhi-hub] "清除聊天记录"：先问一遍，说确定才清（不交给模型，各种模型都能用）
     actual_text = await clear_command.handle(conn, actual_text)
     if actual_text is None:
+        return
+
+    # 明确的单设备家居指令直接执行；歧义、条件、复合或上下文表达继续走模型。
+    if await pre_llm.handle(conn, actual_text, gen):
         return
 
     # 首先进行意图分析，使用实际文本内容
@@ -162,7 +166,7 @@ async def no_voice_close_connect(conn: "ConnectionHandler", have_voice):
                 await conn.close()
                 return
             # [xiaozhi-hub] 配置了固定告别语（end_prompt.reply）时直接说这句再断开，不发给大模型：
-            # 接 Claude Code 时，"请你以时间过得真快开头……"这句假的用户消息会被永久写进对话记录
+            # 否则"请你以时间过得真快开头……"这句假的用户消息会被永久写进对话记录
             farewell = end_prompt.get("reply")
             if farewell:
                 conn.sentence_id = uuid.uuid4().hex

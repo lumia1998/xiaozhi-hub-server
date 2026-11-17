@@ -15,6 +15,8 @@ async def handleAbortMessage(conn: "ConnectionHandler", played_ms=None, drop_aud
     drop_audio：设备自己发的打断（唤醒词、按钮）：说完还没识别完的那句话、排队没处理的录音都不要了。
     服务端回声消除和新问题触发的打断不丢，那时缓冲里是用户新说的话。"""
     conn.logger.bind(tag=TAG).info("Abort message received")
+    from core.agent.task_delivery import defer_delivery
+    defer_delivery(conn)
     # [xiaozhi-hub] 上下文只记已经播出去的部分；要在清队列之前算（用到发送进度）
     if conn.client_is_speaking:
         reply_progress.cut(conn, played_ms)
@@ -27,7 +29,7 @@ async def handleAbortMessage(conn: "ConnectionHandler", played_ms=None, drop_aud
     # 设置成打断状态，会自动打断llm、tts任务
     conn.close_after_chat = False
     conn.client_abort = True
-    # [xiaozhi-hub] 让 LLM 立即停止当前回答（claude_cli 向 Claude Code 发送中断）
+    # [xiaozhi-hub] 让 LLM 立即停止当前回答（Pi 中止这个连接的请求）
     if callable(getattr(conn.llm, "abort", None)):
         conn.llm.abort(conn)
     conn.clear_queues()

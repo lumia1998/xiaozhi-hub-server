@@ -74,6 +74,7 @@ async def main():
     # 启动 Simple http 服务器
     ota_server = SimpleHttpServer(config)
     ota_server.ws_server = ws_server  # [xiaozhi-hub] 管理后台热加载 LLM 时使用
+    ws_server.http_server = ota_server
     ota_task = asyncio.create_task(ota_server.start())
 
     read_config_from_api = config.get("read_config_from_api", False)

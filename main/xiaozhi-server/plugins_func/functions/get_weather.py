@@ -13,6 +13,7 @@ import httpx
 from config.logger import setup_logging
 from plugins_func.register import register_function, ToolType, ActionResponse, Action
 from typing import TYPE_CHECKING
+from core.utils import weather_places
 
 if TYPE_CHECKING:
     from core.connection import ConnectionHandler
@@ -148,6 +149,11 @@ async def find_place(name: str) -> Place:
         if cached[1] is None:
             raise WeatherError(f"没找到「{name}」这个地方")
         return cached[1]
+    stored = await asyncio.to_thread(weather_places.get, name)
+    if stored:
+        place = Place(stored['name'], stored['lat'], stored['lon'])
+        _places[name] = (time.time(), place)
+        return place
     place, failed = None, None
     for lookup in (_nominatim, _open_meteo_geo):
         try:
@@ -163,12 +169,68 @@ async def find_place(name: str) -> Place:
     _places[name] = (time.time(), place)
     if place is None:
         raise WeatherError(f"没找到「{name}」这个地方")
+    try:
+        await asyncio.to_thread(weather_places.put, name, place)
+    except OSError:
+        logger.bind(tag=TAG).warning('地名缓存未写入，本次查询结果仍可使用')
     return place
 
 
 # ---------- 天气 ----------
 
 _reports = {}  # 经纬度 -> (时间, 报告)
+_forecasts = {}  # 直达播报使用结构化预报，最多缓存 10 分钟
+FORECAST_TTL = 600
+
+
+def forecast_params(place):
+    return {
+        'latitude': place.lat, 'longitude': place.lon, 'timezone': 'auto', 'forecast_days': FORECAST_DAYS,
+        'current': 'temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m',
+        'hourly': 'precipitation_probability,precipitation,weather_code',
+        'daily': 'weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max',
+    }
+
+
+def local_date(forecast):
+    # API times are local wall times, while utc_offset_seconds identifies the location's day.
+    return datetime.utcfromtimestamp(time.time() + int(forecast.get('utc_offset_seconds', 0))).date()
+
+
+async def _request_forecast(client, params):
+    """Retry one failed connection; the caller's overall deadline still applies."""
+    for attempt in range(2):
+        try:
+            return await client.get(FORECAST_URL, params=params)
+        except (httpx.ConnectTimeout, httpx.ConnectError) as exc:
+            if attempt:
+                raise
+            logger.bind(tag=TAG).warning(f'天气服务连接失败，重试一次: {type(exc).__name__}')
+
+
+async def fetch_forecast(place):
+    """Fast path: request only weather. Optional air-quality requests cannot delay speech."""
+    key = (round(place.lat, 4), round(place.lon, 4))
+    cached = _forecasts.get(key)
+    if cached and 0 <= time.time() - cached[0] < FORECAST_TTL:
+        if cached[2] == local_date(cached[1]): return cached[1]
+    try:
+        async with _client() as client:
+            response = await _request_forecast(client, forecast_params(place))
+            response.raise_for_status()
+            data = response.json()
+        if not isinstance(data, dict) or not isinstance(data.get('daily'), dict):
+            raise ValueError('missing forecast')
+        current_date = local_date(data)
+        if current_date.isoformat() not in data['daily'].get('time', []):
+            raise ValueError('outdated forecast')
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, OverflowError) as exc:
+        logger.bind(tag=TAG).warning(f'直达天气查询失败: {type(exc).__name__}')
+        raise WeatherError('天气服务暂时连不上') from None
+    if len(_forecasts) >= 128:
+        oldest = min(_forecasts, key=lambda k: _forecasts[k][0]); _forecasts.pop(oldest, None)
+    _forecasts[key] = (time.time(), data, current_date)
+    return data
 
 
 def _num(value, digits=0):
@@ -271,14 +333,7 @@ async def fetch_report(place: Place) -> str:
     common = {"latitude": place.lat, "longitude": place.lon, "timezone": "auto"}
     try:
         async with _client() as client:
-            forecast_req = client.get(FORECAST_URL, params={
-                **common, "forecast_days": FORECAST_DAYS,
-                "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,"
-                           "wind_speed_10m,wind_direction_10m",
-                "hourly": "precipitation_probability,precipitation,weather_code",
-                "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,"
-                         "precipitation_probability_max",
-            })
+            forecast_req = client.get(FORECAST_URL, params=forecast_params(place))
             air_req = client.get(AIR_URL, params={**common, "current": "pm2_5"})
             forecast_resp, air_resp = await asyncio.gather(forecast_req, air_req, return_exceptions=True)
         if isinstance(forecast_resp, Exception):

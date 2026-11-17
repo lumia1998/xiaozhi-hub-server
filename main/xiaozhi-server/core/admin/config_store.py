@@ -29,12 +29,7 @@ SECRET_FIELD = re.compile(
     re.I,
 )
 # 条目里原本没有、但允许在后台新增的字段：{条目 type: {字段: 类型}}
-ADDABLE_FIELDS = {
-    "openai": {"extra_body": "json"},
-    # 后来新增的配置项：老用户的配置文件里没有，也要能在后台改
-    "claude_cli": {"progress_interval_seconds": "number", "progress_reply": "text",
-                   "background_max_seconds": "number", "background_after_seconds": "number"},
-}
+ADDABLE_FIELDS = {"openai": {"extra_body": "json"}}
 
 
 def default_config_path() -> Path:

@@ -8,10 +8,8 @@ Live 模式（``RUN_LIVE_API_TESTS=1``）：调真实 TTS provider。
     text_to_speak(text, output_file) -> 异步，把合成结果写到 output_file
 
 注意：
-- 3 个构造测试不依赖云服务；第 4 个 test_tts_text_to_speak_writes_nonempty_file
-  才是真链路测试，会真发 HTTP。
-- Mock 模式下：第 4 个测试断言宽松 —— 文件存在即可（shim 创建空文件），
-  不强求 size > 0。Live 模式下严格校验 size > 0。
+- 3 个构造测试不依赖云服务；第 4 个 test_tts_text_to_speak_writes_file 是真链路测试，
+  会真发 HTTP，只在 Live 模式跑（装了 edge_tts 时 shim 不生效，mock 模式也会真请求）。
 """
 from __future__ import annotations
 
@@ -81,8 +79,9 @@ def test_tts_provider_has_output_dir() -> None:
     assert provider.output_file, "output_file 不应为空"
 
 
+@pytest.mark.skipif(not LIVE_API_TESTS, reason="真发请求合成，只在 Live 模式跑：export RUN_LIVE_API_TESTS=1")
 def test_tts_text_to_speak_writes_file() -> None:
-    """Mock 模式：断言 file 存在即可。Live 模式：断言 size > 0。
+    """真发请求合成一句，写出的文件不能是空的。
 
     参考 performance_tester_tts.py 的实现：
     - mock conn（sample_rate/audio_format/stop_event/client_abort/headers）
@@ -117,8 +116,7 @@ def test_tts_text_to_speak_writes_file() -> None:
         asyncio.run(run())
 
         assert os.path.exists(out_file), f"输出文件不存在：{out_file}"
-        if LIVE_API_TESTS:
-            assert os.path.getsize(out_file) > 0, f"输出文件为空：{out_file}"
+        assert os.path.getsize(out_file) > 0, f"输出文件为空：{out_file}"
     finally:
         if os.path.exists(out_file):
             try:
