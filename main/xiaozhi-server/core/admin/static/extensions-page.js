@@ -242,7 +242,10 @@ async function renderExtensions(root, kind) {
         ${[['streamable-http', 'Streamable HTTP'], ['sse', 'SSE'], ['stdio', '本地程序 / stdio']].map(([value, label]) =>
           `<option value="${value}" ${draft.transport === value ? 'selected' : ''}>${label}</option>`).join('')}
         </select></label><label class="f" for="ext-timeout">超时（秒）<input id="ext-timeout" name="timeout" class="in" type="number" min="1" max="60" step="any" required value="${esc(draft.timeout)}"></label></div>
-        <div id="ext-connection"></div>`}
+        <div id="ext-connection"></div>
+        <label class="f" for="ext-allow">允许的工具（JSON 数组）</label>
+        <p id="ext-allow-note" class="field-note">留空开放全部，[] 不开放任何工具。</p>
+        <textarea id="ext-allow" name="allowed_tools" class="in code-editor" rows="2" aria-describedby="ext-allow-note">${esc(draft.allowed_tools ? JSON.stringify(draft.allowed_tools) : '')}</textarea>`}
       <p id="ext-editor-result" class="extensions-result" role="status"></p>
       <p id="ext-discard-note" class="ext-discard-note">内容尚未保存，可继续编辑或放弃修改。</p>
       <footer class="extension-dialog-actions">
@@ -289,6 +292,11 @@ async function renderExtensions(root, kind) {
         row.timeout = Number(get('ext-timeout').value);
         try {
           const stdio = row.transport === 'stdio';
+          const allow = get('ext-allow').value.trim();
+          if (allow) {
+            row.allowed_tools = JSON.parse(allow);
+            if (!Array.isArray(row.allowed_tools) || row.allowed_tools.some(name => typeof name !== 'string' || !name.trim())) throw Error('工具名称需要是非空文本数组。');
+          } else delete row.allowed_tools;
           const secret = get('ext-secret');
           const value = secret.value.trim() ? JSON.parse(secret.value) : null;
           if (value !== null && (typeof value !== 'object' || Array.isArray(value)

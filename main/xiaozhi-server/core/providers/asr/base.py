@@ -291,6 +291,7 @@ class ASRProviderBase(ABC):
             if text_len > 0:
                 audio_snapshot = pcm_data.copy()
                 enqueue_asr_report(conn, enhanced_text, audio_snapshot)
+                conn.asr_timing = (gen, round(total_time * 1000))
                 # 使用自定义模块进行上报
                 await startToChat(conn, enhanced_text, gen=gen)
             elif not turn_gen.stale(conn, gen):

@@ -191,7 +191,7 @@ def test_pi_uses_shared_results_as_model_data_never_direct_tts(state, use_tool):
     conn.tts = SimpleNamespace(tts_text_queue=queue.Queue(), store_tts_text=MagicMock())
     with patch.object(chat.llm_router, "not_ready_reply", return_value=None), \
          patch.object(chat.chat_history, "device_of", return_value=""), \
-         patch.object(chat.extensions, "add_skills", side_effect=lambda dialogue, _: dialogue):
+         patch.object(chat.extensions, "enabled_skills", return_value={}):
         chat.chat(conn, "请查共享记忆里我之前的饮食偏好", "sentence-one")
     spoken = [str(item.content_detail) for item in list(conn.tts.tts_text_queue.queue) if item.content_detail]
     assert "模型整理后的回答。" in spoken, conn.logger.warning.call_args_list

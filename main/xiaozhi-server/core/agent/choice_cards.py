@@ -75,7 +75,7 @@ def validate(arguments):
     return {'question': question.strip(), 'options': normalized}
 
 
-def execute(conn, arguments, call_id, sentence_id, stale):
+def execute(conn, arguments, call_id, sentence_id, stale, *, device_choice=False):
     try:
         if not supported(conn) or stale():
             raise ValueError('当前设备无法展示选项或本轮已取消')
@@ -83,7 +83,8 @@ def execute(conn, arguments, call_id, sentence_id, stale):
         device, owner, epoch, model = identity(conn)
         if not device:
             raise ValueError('设备身份无效')
-        card.update(id=uuid.uuid4().hex, selected=None, expires=time.time() + 86400)
+        card.update(id=('ha_' if device_choice else '') + uuid.uuid4().hex, selected=None,
+                    expires=time.time() + (45 if device_choice else 86400))
         with database() as db:
             db.execute('DELETE FROM choices WHERE expires < ?', (time.time() - 86400 * 7,))
             db.execute('INSERT INTO choices VALUES(?,?,?,?,?,?,?,NULL)',

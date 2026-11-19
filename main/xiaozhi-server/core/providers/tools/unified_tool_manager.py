@@ -2,6 +2,7 @@
 
 from typing import Dict, List, Optional, Any
 from config.logger import setup_logging
+from core.agent.tool_status import observing
 from plugins_func.register import Action, ActionResponse
 from .base import ToolType, ToolDefinition, ToolExecutor
 
@@ -93,7 +94,8 @@ class ToolManager:
 
             # 执行工具
             self.logger.info(f"执行工具: {tool_name}，参数: {arguments}")
-            result = await executor.execute(self.conn, tool_name, arguments)
+            async with observing(self.conn, tool_name):
+                result = await executor.execute(self.conn, tool_name, arguments)
             self.logger.debug(f"工具执行结果: {result}")
             return result
 

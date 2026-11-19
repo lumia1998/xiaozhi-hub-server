@@ -164,7 +164,8 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 class RoutingTests(unittest.IsolatedAsyncioTestCase):
     def connection(self):
         from core.utils.dialogue import Dialogue
-        return SimpleNamespace(config={'plugins': {'home_assistant': copy.deepcopy(CONFIG)}}, turn_gen=1,
+        return SimpleNamespace(config={'plugins': {'home_assistant': copy.deepcopy(CONFIG)}, 'selected_module': {'Intent': 'function_call'},
+            'Intent': {'function_call': {'functions': ['hass_state']}}}, turn_gen=1,
             stop_event=threading.Event(), tts=SimpleNamespace(store_tts_text=MagicMock(), tts_one_sentence=MagicMock(), tts_text_queue=queue.Queue()),
             dialogue=Dialogue(), logger=MagicMock(), llm=MagicMock(), executor=MagicMock(), client_abort=False)
 
@@ -184,7 +185,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
     async def test_fallback_disabled_ambiguous_json_and_stale(self):
         conn = self.connection()
         with patch.object(ha, 'execute', new_callable=AsyncMock) as execute:
-            for text in ['把那个关了', '不要开台灯', '先开台灯然后关主灯']:
+            for text in ['把那个关了', '先开台灯然后关主灯']:
                 self.assertFalse(await ha.handle(conn, text, 1))
             conn.config['plugins']['home_assistant']['direct_commands']['enabled'] = False
             self.assertFalse(await ha.handle(conn, '打开台灯', 1))

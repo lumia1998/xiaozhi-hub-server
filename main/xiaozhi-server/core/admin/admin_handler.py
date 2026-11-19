@@ -89,6 +89,8 @@ class AdminHandler:
         self._sticker_annotation_slots = asyncio.Semaphore(1)
 
     def register(self, app: web.Application) -> None:
+        from core.api import display_panels
+        display_panels.register(app, self)
         app.add_routes(
             [
                 web.get("/admin", self.handle_index),
@@ -690,10 +692,13 @@ class AdminHandler:
         if not self._from_this_machine(request):
             return self._error("仅限本机", 403)
         asr = getattr(self.ws_server, "_asr", None)
+        return await self.transcribe_pcm(request, asr)
+
+    async def transcribe_pcm(self, request, asr):
         if not callable(getattr(asr, "recognize_pcm", None)):
             return self._error("当前语音识别不是本机模型", 501)
         pcm = await request.read()
-        if len(pcm) < 2 or len(pcm) > KIOSK_ASR_MAX_BYTES:
+        if len(pcm) < 2 or len(pcm) % 2 or len(pcm) > KIOSK_ASR_MAX_BYTES:
             return self._error("要 10 秒以内的 16kHz 单声道 16 位 PCM", 400)
         started = time.monotonic()
         text = await self._blocking(asr.recognize_pcm, pcm)

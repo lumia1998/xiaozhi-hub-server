@@ -299,6 +299,9 @@ async def _do_send_audio(conn: "ConnectionHandler", opus_packet, flow_control):
         await conn.websocket.send(opus_packet)
 
     # 更新流控状态
+    timing = getattr(conn, 'turn_timing', None)
+    if packet_index == 0 and timing and getattr(conn, 'turn_sids', {}).get(flow_control.get('sentence_id')) == timing.generation:
+        timing.mark('first_opus_sent')
     flow_control["packet_count"] = packet_index + 1
     flow_control["sequence"] = sequence + 1
     # [xiaozhi-hub] 估算设备播完已收到音频的时间（每包 AUDIO_FRAME_DURATION 毫秒）
@@ -380,8 +383,10 @@ async def send_stt_message(conn: "ConnectionHandler", text):
         # 如果不是JSON格式，直接使用原始文本
         display_text = text
     stt_text = textUtils.get_string_no_punctuation_or_emoji(display_text)
+    timing = getattr(conn, 'turn_timing', None)
     await conn.websocket.send(
-        json.dumps({"type": "stt", "text": stt_text, "session_id": conn.session_id})
+        json.dumps({"type": "stt", "text": stt_text, "session_id": conn.session_id,
+                    **({'timing_id': timing.id, 'voice_input': timing.voice} if timing else {})})
     )
     await send_tts_message(conn, "start")
     # 发送start消息后客户端状态会处于说话中状态，同步服务端状态

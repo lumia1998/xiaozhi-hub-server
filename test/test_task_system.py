@@ -234,6 +234,7 @@ class TaskSystemTests(unittest.TestCase):
         conn = _Conn("打开台灯")
         conn.config = {"plugins": {"home_assistant": {"direct_commands": {"enabled": True}, "devices": ["客厅,台灯,light.lamp"]}}}
         command = SimpleNamespace(action="turn_on", device=SimpleNamespace(entity_id="light.lamp"))
+        conn.config.update(selected_module={'Intent': 'function_call'}, Intent={'function_call': {'functions': ['hass_set_state']}})
         with patch("plugins_func.pre_llm.home_assistant.match", return_value=command), \
              patch("core.agent.ha_commands.execute", return_value=ExecutionResult("台灯已打开。", True)):
             result = __import__("asyncio").run(home_assistant.intercept(conn, "打开台灯"))

@@ -91,8 +91,43 @@ async def test_pi_model_can_call_media_tool(monkeypatch):
     monkeypatch.setattr(pi_chat.chat_history, 'device_of', lambda _: '')
     monkeypatch.setattr(pi_chat.chat_history, 'memory_context_for', lambda _: {})
     monkeypatch.setattr(pi_chat.llm_router, 'not_ready_reply', lambda _: None)
-    monkeypatch.setattr(pi_chat.extensions, 'add_skills', lambda dialogue, _: dialogue)
+    monkeypatch.setattr(pi_chat.extensions, 'enabled_skills', lambda _: {})
     await asyncio.to_thread(pi_chat.chat, conn, '展示这段视频', 'turn')
     conn.websocket.send.assert_awaited_once()
     spoken = [item.content_detail for item in conn.tts.tts_text_queue.queue if item.content_detail]
     assert spoken == ['内容已发送到屏幕。']
+
+
+def test_skill_view_body_only_reaches_active_model(monkeypatch):
+    from core.agent import pi_chat
+    from core.utils.dialogue import Dialogue
+
+    skill = dict(id='trip', name='出行', description='安排出行', content='仅按需读取的说明正文')
+    received = []
+
+    class Provider:
+        model_name = 'test'
+
+        def events(self, session, dialogue, functions, tool, stale):
+            assert skill['content'] not in dialogue[0]['content']
+            assert 'skill_view' in {item['function']['name'] for item in functions}
+            for name, args in [('not_offered', {}), ('skill_view', {'id': 'disabled'})]:
+                assert tool({'name': name, 'arguments': args, 'call_id': 'bad'})['error']
+            result = tool({'name': 'skill_view', 'arguments': {'id': 'trip'}, 'call_id': 'read'})
+            received.append(result)
+            yield {'type': 'message', 'message': {'role': 'toolResult', 'toolCallId': 'read',
+                                                 'content': [{'type': 'text', 'text': result['text']}]}}
+            yield {'type': 'text', 'text': '可以出发。'}
+
+    conn = SimpleNamespace(features={}, config={}, session_id='test', llm=Provider(), dialogue=Dialogue(),
+                           logger=MagicMock(), stop_event=threading.Event(), intent_type='nointent',
+                           tts=SimpleNamespace(tts_text_queue=queue.Queue(), store_tts_text=MagicMock()),
+                           _superseded=lambda _: False, _put_reply=MagicMock())
+    monkeypatch.setattr(pi_chat.chat_history, 'device_of', lambda _: '')
+    monkeypatch.setattr(pi_chat.chat_history, 'memory_context_for', lambda _: {})
+    monkeypatch.setattr(pi_chat.llm_router, 'not_ready_reply', lambda _: None)
+    monkeypatch.setattr(pi_chat.extensions, 'enabled_skills', lambda _: {'trip': skill})
+    pi_chat.chat(conn, '帮我安排出行', 'turn')
+    assert received == [{'text': skill['content'], 'error': False, 'terminate': False}]
+    assert skill['content'] not in str([message.content for message in conn.dialogue.dialogue])
+    assert '可以出发。' in ''.join(item.content_detail or '' for item in conn.tts.tts_text_queue.queue)

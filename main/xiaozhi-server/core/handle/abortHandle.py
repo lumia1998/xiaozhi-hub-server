@@ -23,6 +23,7 @@ async def handleAbortMessage(conn: "ConnectionHandler", played_ms=None, drop_aud
     # [xiaozhi-hub] 旧的一轮作废：还在识别的那句、模型还在出的字、合成里的句子迟到了一律丢掉
     # （新的一轮开始时会把 client_abort 清回 False，不能只靠它）
     turn_gen.bump(conn)
+    conn.ha_context = None
     conn.sentence_id = uuid.uuid4().hex
     if drop_audio:
         _drop_pending_audio(conn)

@@ -4,6 +4,18 @@
 
 配套设备客户端为 [xiaozhi-thinksmart-client](https://github.com/lumia1998/xiaozhi-thinksmart-client)。
 
+### 对话路由与扩展
+
+配对的 ThinkSmart 客户端可通过 `/display/weather` 和 `/display/devices` 获取天气、设备状态；开关操作只接受明确的目标状态，复用 Home Assistant 的设备白名单和读写权限。面板接口要求设备配对，不依赖聊天会话，也不向客户端下发 Home Assistant 凭据。
+
+- “现在几点”“今天几号”“今天星期几”使用设备上报的时区直接回答；旧设备沿用 `server.timezone_offset`。设置 `direct_clock: false` 可关闭。带地点、条件或其他任务的问题保留给模型。
+- 家居直达还需启用对应 Intent 的 `hass_get_state` / `hass_set_state`（或 `hass_state` 模块）。直达和模型的家居状态工具只访问配置中列出的实体；只开查询不能控制设备。
+- 每轮只注入已启用 Skill 的目录。模型用只读 `skill_view` 获取正文；`/技能ID` 或“使用出行技能，……”可以显式载入一个技能。不执行技能内的脚本。
+- 后台 MCP 编辑器的“允许的工具”使用服务器原始名称。留空保持兼容（全部开放），`[]` 不开放任何工具，`["lookup"]` 只开放 `lookup`。保存后新连接生效。
+- 服务端 MCP 首次或配置变更后连接并发现工具；同配置的新会话在十分钟内复用进程内目录，实际调用时才连接并核对工具定义。目录不代表在线，失败的设备操作不自动重试。
+- 同名家电不猜目标：2–4 个可区分候选支持卡片或下一句说房间名。选择绑定当前连接、设备归属和模型，最多保留 45 秒；打断、换话题后失效。成功确认目标后可接“再暗一点”；结果未知时“刚才成功了吗”只查状态，不重发控制命令。
+- 性能日志 `turn_latency` 仅包含随机轮次 ID、阶段、毫秒数。将 Hub 和音箱的日志导出后运行 `python test/latency_report.py hub.log speaker.log`，可按直达、普通模型、MCP 调用是否需要建连分别查看样本数及 P50/P95。每侧使用单调时钟，不相减跨机时间戳。`asr` 包含说完后的识别及声纹等待，`model_first_text` / `first_opus_sent` 从 Hub 开始路由计时；`speech_end_to_output` 从客户端最后检测到语音到首段回复 PCM 进入扬声器输出并加上驱动报告的 DAC 延迟，不是麦克风实测的声学首声。文字提问不会混入这个语音指标。
+
 ```text
 ThinkSmart / 小智协议设备
         ⇅ WebSocket JSON + Opus

@@ -35,6 +35,14 @@ class ListenTextMessageHandler(TextMessageHandler):
             try:
                 if not isinstance(selection, dict):
                     raise ValueError('选择参数无效')
+                if isinstance(request_id, str) and request_id.startswith('ha_'):
+                    from plugins_func.pre_llm import home_assistant
+                    pending = home_assistant.active(conn)
+                    option = selection.get('option_id')
+                    if not pending or pending['card'] != request_id or option not in [str(index+1) for index in range(len(pending['commands']))]:
+                        raise ValueError('设备选择已失效，请重新提问')
+                    await startToChat(conn, '第'+option+'个', ha_card=request_id)
+                    return
                 result = await asyncio.to_thread(choice_cards.select, conn, request_id, selection.get('option_id'))
                 await conn.websocket.send(json.dumps({'type': 'choice_result', 'id': request_id,
                     'ok': True, 'selected': result['selected'], 'session_id': conn.session_id}))

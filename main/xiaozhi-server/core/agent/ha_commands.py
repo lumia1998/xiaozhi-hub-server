@@ -89,11 +89,34 @@ def devices(ha):
     return tuple(found.values())
 
 
-def parse(text, ha):
-    t = normalize(text)
-    t = ADDRESS.sub('', t, count=1)
-    t = POLITE.sub('', t, count=1)
-    t = re.sub(r'^(?:把|将)', '', t, count=1)
+def allowed(config, entity_id, *, write):
+    selected = (config.get('selected_module') or {}).get('Intent')
+    intent = (config.get('Intent') or {}).get(selected) or {}
+    if intent.get('type', selected) not in ('intent_llm', 'function_call'):
+        return False
+    functions = intent.get('functions') or []
+    if 'hass_state' not in functions and ('hass_set_state' if write else 'hass_get_state') not in functions:
+        return False
+    plugins = config.get('plugins') or {}
+    ha = plugins.get('home_assistant') or plugins.get('hass_state') or {}
+    rows = ha.get('devices') or []
+    if isinstance(rows, str):
+        rows = rows.splitlines()
+    return isinstance(entity_id, str) and bool(re.fullmatch(r'[a-z0-9_]+\.[a-z0-9_]+', entity_id)) and any(
+        len(fields) == 3 and fields[2].strip() == entity_id for row in rows if isinstance(row, str)
+        for fields in [re.split('[,，]', row)])
+
+
+def command_body(text):
+    body = normalize(text).lstrip('呃嗯')
+    body = ADDRESS.sub('', body, count=1).lstrip('呃嗯')
+    return POLITE.sub('', body, count=1)
+
+
+def candidates(text, ha):
+    body = command_body(text)
+    has_object_marker = body.startswith(('把', '将'))
+    t = body[1:] if has_object_marker else body
     t = SUFFIX.sub('', t, count=1)
     matches = set()
     for device in devices(ha):
@@ -105,8 +128,10 @@ def parse(text, ha):
                 ('state', rf'{a}(?:的)?(?:亮度|音量)(?:是多少|有多大|多大|多少)'),
             ]
             if device.domain in ('light', 'switch', 'media_player'):
-                patterns += [('turn_on', rf'(?:(?:打开|开启|开){a}|{a}(?:打开|开启|开灯|开))'),
-                             ('turn_off', rf'(?:(?:关闭|关掉|关上|关){a}|{a}(?:关闭|关掉|关上|关灯|关))')]
+                patterns += [('turn_on', rf'(?:(?:打开|开启|开)(?:一下)?{a}|{a}(?:打开|开启|开灯|开))'),
+                             ('turn_off', rf'(?:(?:关闭|关掉|关上|关)(?:一下)?{a}|{a}(?:关闭|关掉|关上|关灯|关))')]
+                if has_object_marker and isinstance(text, str) and not text.rstrip().endswith(('?', '？')):
+                    patterns += [('turn_on', rf'{a}(?:开|打开)了'), ('turn_off', rf'{a}(?:关|关掉|关闭)了')]
             if device.domain == 'light':
                 patterns += [('brightness_up', rf'{a}(?:调亮|亮)(?:一点|一些)|(?:调亮){a}'),
                              ('brightness_down', rf'{a}(?:调暗|暗)(?:一点|一些)|(?:调暗){a}'),
@@ -127,7 +152,12 @@ def parse(text, ha):
                 if action in ('brightness', 'volume') and value is None: continue
                 matches.add(Command(device, action, value))
     # Duplicate short names across rooms must remain for the model to disambiguate.
-    return next(iter(matches)) if len(matches) == 1 else None
+    return sorted(matches, key=lambda command: (command.device.label, command.device.entity_id, command.action))
+
+
+def parse(text, ha):
+    matches = candidates(text, ha)
+    return matches[0] if len(matches) == 1 else None
 
 
 class Superseded(Exception):
@@ -136,14 +166,15 @@ class Superseded(Exception):
 
 class ExecutionResult(str):
     """String-compatible response carrying the verified outcome from HA state."""
-    def __new__(cls, reply, confirmed=False):
+    def __new__(cls, reply, confirmed=False, status='unknown'):
         value = super().__new__(cls, reply)
         value.confirmed = bool(confirmed)
+        value.status = 'confirmed' if confirmed else status
         return value
 
 
-def _outcome(reply, confirmed=False):
-    return ExecutionResult(reply, confirmed)
+def _outcome(reply, confirmed=False, status='unknown'):
+    return ExecutionResult(reply, confirmed, status)
 
 
 def _fresh(check):
@@ -275,7 +306,7 @@ async def execute(command, ha, stale=lambda: False, transport=None):
                 _fresh(stale)
                 observed = await read()
                 if confirmed(observed, expected): return _outcome(reply, True)
-            return _outcome(f'已向{device.label}发送指令，设备状态尚未更新。')
+            return _outcome(f'已向{device.label}发送指令，设备状态尚未更新。', status='submitted')
     except Superseded:
         raise
     except httpx.HTTPStatusError as error:

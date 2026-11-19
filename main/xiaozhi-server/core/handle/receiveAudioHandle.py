@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     from core.connection import ConnectionHandler
 from core.utils.util import audio_to_data
 from core.agent import clear_command, pre_llm
+from core.agent.turn_timing import Timing
 from core.agent.call_names import handle_call_name
 from core.handle.abortHandle import handleAbortMessage
 from core.handle.intentHandler import handle_user_intent, speak_txt
@@ -51,7 +52,7 @@ async def handleAudioMessage(conn: "ConnectionHandler", pcm_frame):
     await conn.asr.receive_audio(conn, pcm_frame, have_voice)
 
 
-async def startToChat(conn: "ConnectionHandler", text, gen=None):
+async def startToChat(conn: "ConnectionHandler", text, gen=None, *, ha_card=None):
     """gen：这句话说完时的轮次代次（turn_gen）；之后设备打断过就不再回答它。"""
     if gen is not None and turn_gen.stale(conn, gen):
         conn.logger.bind(tag=TAG).info(f"这句话说完后被打断过，不再回答: {text}")
@@ -104,11 +105,22 @@ async def startToChat(conn: "ConnectionHandler", text, gen=None):
 
     # manual 模式下不打断正在播放的内容
     if conn.client_is_speaking and conn.client_listen_mode != "manual":
+        pending = getattr(conn, 'ha_context', None) if ha_card else None
+        before = turn_gen.current(conn)
         await handleAbortMessage(conn)
+        if pending and turn_gen.current(conn) == before + 1:
+            pending['gen'] = before + 1
+            conn.ha_context = pending
 
     # [xiaozhi-hub] 新的一轮从这里开始：之前的轮次作废；下面呼名、意图识别、发 stt 都要等，
     # 期间设备打断了就不再回答
+    asr = getattr(conn, 'asr_timing', None)
+    conn.asr_timing = None
+    previous_gen = gen
     gen = turn_gen.bump(conn)
+    timing = conn.turn_timing = Timing(conn, gen, voice=previous_gen is not None)
+    if asr and asr[0] == previous_gen:
+        timing.logger.info(f'turn_latency id={timing.id} stage=asr ms={asr[1]}')
 
     # [xiaozhi-hub] 呼名：句首"嗨 DeepSeek"先去掉称呼；只有称呼时直接回复，不发给模型
     actual_text = await handle_call_name(conn, actual_text)
@@ -120,7 +132,7 @@ async def startToChat(conn: "ConnectionHandler", text, gen=None):
     if actual_text is None:
         return
 
-    if getattr(conn, 'last_choice_id', None):
+    if getattr(conn, 'last_choice_id', None) and not conn.last_choice_id.startswith('ha_'):
         from core.agent.choice_cards import voice_selection
         result = await asyncio.to_thread(voice_selection, conn, actual_text)
         conn.last_choice_id = None
@@ -130,8 +142,18 @@ async def startToChat(conn: "ConnectionHandler", text, gen=None):
                 'selected': result['selected'], 'session_id': conn.session_id}))
 
     # 明确的单设备家居指令直接执行；歧义、条件、复合或上下文表达继续走模型。
+    if ha_card:
+        from plugins_func.pre_llm import home_assistant
+        pending = home_assistant.active(conn, previous=True)
+        selected = home_assistant.match(conn, actual_text)
+        if not pending or pending['card'] != ha_card or not isinstance(selected, home_assistant.ha_commands.Command):
+            raise ValueError('设备选择已失效，请重新提问')
+        if not home_assistant.ha_commands.allowed(conn.config, selected.device.entity_id, write=selected.action != 'state'):
+            raise ValueError('当前设置未授权这项设备操作')
     if await pre_llm.handle(conn, actual_text, gen):
         return
+    if ha_card:
+        raise ValueError('设备选择已失效，请重新提问')
 
     # 首先进行意图分析，使用实际文本内容
     intent_handled = await handle_user_intent(conn, actual_text)
@@ -145,6 +167,7 @@ async def startToChat(conn: "ConnectionHandler", text, gen=None):
         return
 
     # 意图未被处理，继续常规聊天流程，使用实际文本内容
+    timing.mark('route_model')
     await send_stt_message(conn, actual_text)
 
     # 准备开始新会话

@@ -175,7 +175,7 @@ async def test_pi_search_send_and_one_per_turn(tmp_path, monkeypatch):
     monkeypatch.setattr(pi_chat.chat_history, 'device_of', lambda _: '')
     monkeypatch.setattr(pi_chat.chat_history, 'memory_context_for', lambda _: {})
     monkeypatch.setattr(pi_chat.llm_router, 'not_ready_reply', lambda _: None)
-    monkeypatch.setattr(pi_chat.extensions, 'add_skills', lambda dialogue, _: dialogue)
+    monkeypatch.setattr(pi_chat.extensions, 'enabled_skills', lambda _: {})
     await asyncio.to_thread(pi_chat.chat, conn, '发一张收到的表情', 'turn')
     conn.websocket.send.assert_awaited_once()
     spoken = [item.content_detail for item in conn.tts.tts_text_queue.queue if item.content_detail]

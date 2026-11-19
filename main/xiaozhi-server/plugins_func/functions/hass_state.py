@@ -90,17 +90,20 @@ async def hass_set_state(conn: "ConnectionHandler", entity_id="", state=None):
         state = {}
     try:
         ha_response = await handle_hass_set_state(conn, entity_id, state)
-        return ActionResponse(Action.REQLLM, ha_response, None)
+        return ActionResponse(Action.RESPONSE, ha_response, ha_response)
     except httpx.TimeoutException:
         logger.bind(tag=TAG).error("设置Home Assistant状态超时")
-        return ActionResponse(Action.ERROR, "请求超时", None)
+        return ActionResponse(Action.ERROR, "设备操作结果未确认，请先查询状态。", "设备操作结果未确认，请先查询状态。")
     except Exception as e:
-        error_msg = f"执行Home Assistant操作失败"
+        error_msg = f"设备操作结果未确认，请先查询状态。"
         logger.bind(tag=TAG).error(error_msg)
         return ActionResponse(Action.ERROR, error_msg, None)
 
 
 async def handle_hass_get_state(conn: "ConnectionHandler", entity_id):
+    from core.agent.ha_commands import allowed
+    if not allowed(conn.config, entity_id, write=False):
+        return '当前设置未授权查询这个设备。'
     ha_config = initialize_hass_handler(conn)
     api_key = ha_config.get("api_key")
     base_url = ha_config.get("base_url")
@@ -156,6 +159,9 @@ async def handle_hass_get_state(conn: "ConnectionHandler", entity_id):
 
 
 async def handle_hass_set_state(conn: "ConnectionHandler", entity_id, state):
+    from core.agent.ha_commands import allowed
+    if not allowed(conn.config, entity_id, write=True):
+        return '当前设置未授权操作这个设备。'
     ha_config = initialize_hass_handler(conn)
     api_key = ha_config.get("api_key")
     base_url = ha_config.get("base_url")
@@ -263,6 +269,6 @@ async def handle_hass_set_state(conn: "ConnectionHandler", entity_id, state):
         f"设置状态:{description},url:{url},return_code:{response.status_code}"
     )
     if response.status_code == 200:
-        return description
+        return '设备指令已提交，状态尚未核实。'
     else:
         return f"设置失败，错误码: {response.status_code}"

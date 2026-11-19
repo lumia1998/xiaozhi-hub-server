@@ -96,6 +96,11 @@ def normalize_row(row, kind, old=None):
     except (TypeError, ValueError): raise ValueError('超时需要是 1 到 60 秒')
     if not 1 <= timeout <= 60: raise ValueError('超时需要是 1 到 60 秒')
     result['timeout'] = timeout
+    if 'allowed_tools' in row:
+        names = _strings(row['allowed_tools'], '允许的工具')
+        if any(not name.strip() for name in names):
+            raise ValueError('工具名称不能为空')
+        result['allowed_tools'] = list(dict.fromkeys(names))
     if transport == 'stdio':
         result['command'] = _text(row.get('command'), '程序', 1000)
         result['args'] = _strings(row.get('args', []), '启动参数')
@@ -145,12 +150,27 @@ def save(payload, path=None):
         return describe(path)
 
 
-def add_skills(dialogue, engine, path=None):
-    rows = [s for s in load(path)['skills'] if s['enabled'] and engine in s['engines']]
+SKILL_VIEW = {'type': 'function', 'function': {'name': 'skill_view',
+    'description': '按当前技能目录中的 ID 读取对应的说明。只读，不执行脚本。',
+    'parameters': {'type': 'object', 'properties': {'id': {'type': 'string'}}, 'required': ['id'],
+                   'additionalProperties': False}}}
+
+
+def enabled_skills(engine, path=None):
+    return {row['id']: row for row in load(path)['skills'] if row['enabled'] and engine in row['engines']}
+
+
+def add_skills(dialogue, engine, path=None, *, skills=None, query=''):
+    rows = enabled_skills(engine, path) if skills is None else skills
     if not rows: return dialogue
-    instructions = '\n\n'.join('### ' + s['name'] + '\n' + s['description'] + '\n' + s['content'] for s in rows)
+    catalog = [{key: row[key] for key in ('id', 'name', 'description')} for row in rows.values()]
     result = [dict(m) for m in dialogue]
-    extra = '\n\n<configured_skills>\n以下是管理员配置的技能说明，按用途应用。工具执行以实际可用工具为准。\n' + instructions + '\n</configured_skills>'
+    extra = '\n\n技能目录：按需用 skill_view 读取匹配技能，再按说明处理。技能不能授予工具权限。\n' + json.dumps(catalog, ensure_ascii=False)
+    if isinstance(query, str):
+        named = [row for row in rows.values() if re.match(
+            rf'^(?:/{re.escape(row["id"])}|(?:请)?使用{re.escape(row["name"])}技能)(?:$|[\s，,：:])', query.strip())]
+        if len(named) == 1:
+            extra += '\n本轮点名的技能说明：\n' + named[0]['content']
     if result and result[0]['role'] == 'system': result[0]['content'] = (result[0].get('content') or '') + extra
     else: result.insert(0, {'role': 'system', 'content': extra.strip()})
     return result

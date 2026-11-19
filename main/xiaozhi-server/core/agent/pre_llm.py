@@ -11,9 +11,10 @@ import time
 import uuid
 
 from core.utils import turn_gen
-from plugins_func.pre_llm import home_assistant, weather
+from core.agent.tool_status import observing
+from plugins_func.pre_llm import clock, home_assistant, weather
 
-PLUGINS = (home_assistant, weather)
+PLUGINS = (home_assistant, weather, clock)
 TAG = __name__
 
 
@@ -34,6 +35,9 @@ async def handle(conn, text, gen):
     if not hasattr(conn, 'pre_llm_lock'): conn.pre_llm_lock = asyncio.Lock()
     async with conn.pre_llm_lock:
         if stale(): return True
+        timing = getattr(conn, 'turn_timing', None)
+        if timing:
+            timing.mark('route_' + plugin.NAME)
         await send_stt_message(conn, heard)
         if stale(): return True
         conn.client_abort = False
@@ -42,14 +46,15 @@ async def handle(conn, text, gen):
         turn_gen.bind(conn, sentence_id, gen)
         started = time.monotonic()
         try:
-            result = await plugin.intercept(conn, heard, stale)
+            async with observing(conn, plugin.NAME):
+                result = await plugin.intercept(conn, heard, stale)
             if not isinstance(result, dict) or result.get('handled') is not True:
                 raise ValueError('Claimed plugin returned an invalid result')
         except Exception as error:
             # Do not echo request tokens or upstream error bodies; never retry a possibly sent POST.
             conn.logger.bind(tag=TAG).warning(f'pre_llm plugin={plugin.NAME} error={type(error).__name__}; no LLM retry')
             result = {'handled': True, 'reply': getattr(plugin, 'ERROR_REPLY', '操作结果未确认，请稍后查询设备状态。')}
-        if result.get('reply') is not None:
+        if result.get('reply') is not None and result.get('record_operation', True):
             try:
                 if chat_history.device_of(conn):
                     await asyncio.to_thread(
@@ -60,6 +65,8 @@ async def handle(conn, text, gen):
                     )
             except Exception as error:
                 conn.logger.bind(tag=TAG).warning(f'pre_llm event could not be saved: {type(error).__name__}')
+        if timing:
+            timing.mark('direct_result', started)
         conn.logger.bind(tag=TAG).info(f'pre_llm plugin={plugin.NAME} handled=true '
             f'action={result.get("action", "none")} entity={result.get("entity", "none")} '
             f'elapsed_ms={round((time.monotonic()-started)*1000)} llm_calls=0')
