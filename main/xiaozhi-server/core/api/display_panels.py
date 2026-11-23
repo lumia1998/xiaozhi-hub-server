@@ -2,9 +2,11 @@ import asyncio
 from types import SimpleNamespace
 
 import httpx
+import aiohttp
 from aiohttp import web
 
 from core.agent import ha_commands
+from core.api.panel_controls import describe
 from plugins_func.functions import get_weather as weather
 
 
@@ -41,16 +43,12 @@ async def devices_panel(config):
     rows = []
     for device in devices:
         data = states.get(device.entity_id, {})
-        state = data.get('state')
-        on = True if state in ('on', 'playing', 'paused', 'idle') else False if state in ('off', 'standby') else None
-        capable = device.domain != 'media_player' or bool((data.get('attributes', {}).get('supported_features') or 0) & (128 if on else 256))
-        rows.append({'id': device.entity_id, 'room': device.room, 'name': device.name, 'on': on,
-                     'writable': on is not None and capable and ha_commands.allowed(config, device.entity_id, write=True)})
+        rows.append(describe(config, device, data, device.room))
     return {'devices': rows}
 
 
 async def set_device(config, body):
-    if not isinstance(body, dict) or not isinstance(body.get('on'), bool):
+    if not isinstance(body, dict):
         raise web.HTTPBadRequest(text='设备开关参数无效')
     entity = body.get('id')
     if not all(ha_commands.allowed(config, entity, write=write) for write in (False, True)):
@@ -59,11 +57,40 @@ async def set_device(config, body):
     device = next((item for item in ha_commands.devices(ha) if item.entity_id == entity), None)
     if device is None:
         raise web.HTTPForbidden(text='该设备不支持面板控制')
-    result = await ha_commands.execute(ha_commands.Command(device, 'turn_on' if body['on'] else 'turn_off'), ha)
+    if set(body) == {'id', 'on'} and isinstance(body['on'], bool):
+        command = ha_commands.Command(device, 'turn_on' if body['on'] else 'turn_off')
+    elif (set(body) == {'id', 'action', 'value'} and type(body['value']) is int and 0 <= body['value'] <= 100
+          and (device.domain, body['action']) in (('light', 'brightness'), ('media_player', 'volume'))):
+        command = ha_commands.Command(device, body['action'], body['value'])
+    else:
+        raise web.HTTPBadRequest(text='设备控制参数无效')
+    result = await ha_commands.execute(command, ha)
     return {'confirmed': result.confirmed, 'message': str(result)}
 
 
 def register(app, admin):
+    from core.admin import speaker_cards
+
+    async def manage(request):
+        admin._require_login(request)
+        path=admin.extensions_path.with_name('speaker-layout.db')
+        try:
+            config=await admin._blocking(admin._merged)
+            cards=await asyncio.wait_for(speaker_cards.catalog(config),12)
+            if request.method=='POST':
+                body=await admin._read_json(request); selected=body.get('selected')
+                if not isinstance(selected,list) or any(not isinstance(key,str) or key not in {c['id'] for c in cards} for key in selected):
+                    return admin._error('卡片不存在，请刷新清单',400)
+                rev,selected=await admin._blocking(speaker_cards.layout,path,selected,body.get('revision'))
+                links=tuple(admin.speaker_preview.links.values())
+                await asyncio.gather(*(asyncio.wait_for(link.ws.send_json({'op':'layout_changed'}),1) for link in links),return_exceptions=True)
+            else: rev,selected=await admin._blocking(speaker_cards.layout,path)
+            return admin._json({'cards':cards,'revision':rev,'selected':selected if selected is not None else speaker_cards.default_ids(cards)})
+        except ValueError as error: return admin._error(str(error),409)
+        except (OSError, asyncio.TimeoutError, aiohttp.ClientError): return admin._error('家庭服务暂不可用，未修改布局',502)
+
+    app.router.add_get('/admin/api/speaker/cards',manage)
+    app.router.add_post('/admin/api/speaker/cards',manage)
     async def panel(request):
         store = admin._pairing_store()
         if not store or not await asyncio.to_thread(store.verify, request.headers.get('Device-Id'), request.headers.get('X-Device-Pairing-Token')):
@@ -79,10 +106,20 @@ def register(app, admin):
             elif request.path.endswith('/weather'):
                 result = await asyncio.wait_for(weather_panel(config, request.remote), timeout=15)
             else:
-                result = await devices_panel(config)
+                _,selected=await asyncio.to_thread(speaker_cards.layout,admin.extensions_path.with_name('speaker-layout.db'))
+                if selected == []: result={'devices':[]}
+                else:
+                    try: cards=await asyncio.wait_for(speaker_cards.catalog(config),12)
+                    except (ValueError,OSError,aiohttp.ClientError,asyncio.TimeoutError):
+                        if selected is not None: raise
+                        result=await devices_panel(config)
+                    else:
+                        order=selected if selected is not None else speaker_cards.default_ids(cards)
+                        by_id={c['id']:c for c in cards}
+                        result={'devices':[by_id[key] for key in order if key in by_id]}
         except web.HTTPException as error:
             return admin._error(error.text, error.status)
-        except (httpx.HTTPError, asyncio.TimeoutError, weather.WeatherError, KeyError, ValueError):
+        except (aiohttp.ClientError,httpx.HTTPError, asyncio.TimeoutError, weather.WeatherError, KeyError, ValueError):
             return admin._error('天气服务暂不可用' if request.path.endswith('/weather') else '无法读取设备状态，请检查家庭服务', 502)
         return web.json_response(result, headers={'Cache-Control': 'no-store'})
 

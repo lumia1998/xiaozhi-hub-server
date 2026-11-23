@@ -403,7 +403,7 @@ async def test_kiosk_only_from_this_machine(kiosk, monkeypatch):
     monkeypatch.setattr(web.BaseRequest, "remote", property(lambda self: "192.168.1.20"))  # 局域网里的其他电脑
     for method, path, body in calls:
         r = await getattr(kiosk, method)(path, json=body)
-        assert r.status == 403 and (await r.json())["error"] == "仅限本机"
+        assert r.status == 403 and (await r.json())["ok"] is False
 
 
 async def test_emotion_single_and_stop(client):

@@ -1,0 +1,7 @@
+{
+  "name": "xiaozhi-hub-console",
+  "private": true,
+  "scripts": { "build": "esbuild src/console.jsx --bundle --minify --jsx=automatic --target=es2020 --global-name=HubConsole --outfile=../static/console-ui.js" },
+  "dependencies": { "@astryxdesign/core": "0.7.16", "@astryxdesign/theme-neutral": "0.7.16", "@stylexjs/stylex": "^0.19.0", "react": "^19.0.0", "react-dom": "^19.0.0" },
+  "devDependencies": { "esbuild": "^0.28.2" }
+}

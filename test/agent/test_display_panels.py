@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -34,6 +35,25 @@ async def test_cards_match_allowlist_and_require_positive_permission(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_light_slider_uses_verified_command_and_write_permission(monkeypatch):
+    config = configuration()
+    lamp = panels.ha_commands.devices(panels.ha_config(config))[1]
+    row = {'state':'on', 'attributes':{'supported_color_modes':['brightness'], 'brightness':128}}
+    assert panels.describe(config, lamp, row, lamp.room)['level'] == {'kind':'brightness','value':50,'writable':True}
+    execute = AsyncMock(return_value=panels.ha_commands.ExecutionResult('设备已确认', confirmed=True))
+    monkeypatch.setattr(panels.ha_commands, 'execute', execute)
+    payload = {'id':lamp.entity_id, 'action':'brightness', 'value':63}
+    assert (await panels.set_device(config, payload))['confirmed']
+    assert execute.await_args.args[0] == panels.ha_commands.Command(lamp, 'brightness', 63)
+    for invalid in ({'value':True}, {'value':101}, {'action':'volume'}, {'on':False}):
+        with pytest.raises(web.HTTPBadRequest): await panels.set_device(config, {**payload, **invalid})
+    config['Intent']['function_call']['functions'] = ['hass_get_state']
+    with pytest.raises(web.HTTPForbidden): await panels.set_device(config, payload)
+    assert not panels.describe(config, lamp, row, lamp.room)['level']['writable']
+    execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_display_routes_require_pairing():
     app = web.Application()
     admin = SimpleNamespace(_pairing_store=lambda:Mock(verify=Mock(return_value=False)),
@@ -54,3 +74,32 @@ async def test_weather_panel_handles_missing_daily_fields(monkeypatch):
                         'daily':{'time':['2026-11-19'],'temperature_2m_min':[-2]}}))
     data = await panels.weather_panel({},None)
     assert data['temperature'] == 0 and data['days'][0]['low'] == -2 and data['days'][0]['high'] is None
+
+
+@pytest.mark.asyncio
+async def test_speaker_cards_layout_preserves_custom_order(tmp_path, monkeypatch):
+    from core.admin import speaker_cards
+
+    cards = [
+        {'id': 'dev-a', 'room': '主卧', 'name': '台灯', 'controls': [{'id': 'light.a', 'name': '台灯', 'on': False, 'writable': True}], 'status': '有可用实体'},
+        {'id': 'dev-b', 'room': '主卧', 'name': '筒灯', 'controls': [{'id': 'light.b', 'name': '筒灯', 'on': True, 'writable': True}], 'status': '有可用实体'},
+        {'id': 'dev-c', 'room': '主卧', 'name': '温湿度计', 'controls': [], 'status': '22°C / 45%'},
+    ]
+    layout_db = tmp_path / 'speaker-layout.db'
+    speaker_cards.layout(layout_db, ['dev-c', 'dev-a'], 0)
+    monkeypatch.setattr(speaker_cards, 'catalog', AsyncMock(return_value=cards))
+
+    app = web.Application()
+    admin = SimpleNamespace(
+        extensions_path=tmp_path / 'extensions.json',
+        _pairing_store=lambda: Mock(verify=Mock(return_value=True)),
+        _blocking=lambda fn, *a: asyncio.to_thread(fn, *a),
+        _merged=lambda: {},
+        _error=lambda text, code: web.json_response({'error': text}, status=code),
+    )
+    panels.register(app, admin)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get('/display/devices', headers={'Device-Id': 'sp1', 'X-Device-Pairing-Token': 'tok'})
+        assert resp.status == 200
+        body = await resp.json()
+        assert [item['id'] for item in body['devices']] == ['dev-c', 'dev-a']

@@ -85,11 +85,14 @@ class AdminHandler:
         self._model_management_lock = asyncio.Lock()
         self._mcp_probe_slots = asyncio.Semaphore(2)
         self.extensions_path = data_dir / 'llm_extensions.json'
+        from core.admin.speaker_preview import SpeakerPreview
+        self.speaker_preview = SpeakerPreview(self, data_dir)
         self.stickers = stickers.StickerStore(data_dir / 'stickers.db')
         self._sticker_annotation_slots = asyncio.Semaphore(1)
 
     def register(self, app: web.Application) -> None:
         from core.api import display_panels
+        self.speaker_preview.register(app)
         display_panels.register(app, self)
         app.add_routes(
             [
@@ -216,8 +219,8 @@ class AdminHandler:
 
     async def handle_asset(self, request: web.Request):
         name = request.match_info['name']
-        if name not in ('tts-page.js', 'tts-page.css', 'models-page.js', 'models-page.css',
-                        'extensions-page.js', 'stickers-page.js', 'stickers-page.css', 'memory-page.js', 'task-page.js', 'admin-shell.js', 'admin-theme.css', 'admin-icons.svg', 'radix-colors.css'):
+        if name not in ('console-ui.js', 'console-ui.css', 'tts-page.js', 'tts-page.css', 'models-page.js', 'models-page.css',
+                        'extensions-page.js', 'stickers-page.js', 'stickers-page.css', 'memory-page.js', 'task-page.js', 'speaker-page.js', 'admin-shell.js', 'admin-theme.css', 'admin-icons.svg', 'radix-colors.css'):
             raise web.HTTPNotFound()
         return web.FileResponse(STATIC_DIR / name, headers=SECURITY_HEADERS)
 
@@ -619,10 +622,16 @@ class AdminHandler:
         带 ?device=<device-id> 时，selected 是这台设备实际会用的模型：它上次切到的（呼名或在这里切换），
         还可用的话；default 始终是后台默认模型。
         """
-        if not self._from_this_machine(request):
-            return self._error("仅限本机", 403)
+        if not await self._device_scope(request,request.query.get('device')):
+            return self._error('需要本机来源或该设备的有效配对令牌',403)
         merged = await self._blocking(self._merged)
         return self._json({"ok": True, **await self._kiosk_models(merged, request.query.get("device"))})
+
+    async def _device_scope(self, request, device):
+        if self._from_this_machine(request): return True
+        if not device or request.headers.get('Device-Id')!=device: return False
+        store=self._pairing_store(); token=request.headers.get('X-Device-Pairing-Token','')
+        return bool(store and token and await asyncio.to_thread(store.verify,device,token))
 
     async def _kiosk_models(self, merged: dict, device: str = None) -> dict:
         options = [{"kind": "api", **c} for c in pages.model_choices(merged)]
@@ -641,10 +650,12 @@ class AdminHandler:
 
         返回切换后的模型列表（同 GET /kiosk/llm?device=…），设备不用再查一次。
         """
-        if not self._from_this_machine(request):
-            return self._error("仅限本机", 403)
+        if not await self._device_scope(request,request.headers.get('Device-Id')):
+            return self._error('需要本机来源或该设备的有效配对令牌',403)
         body = await self._read_json(request)
         device = str(body.get("device") or "")
+        if not self._from_this_machine(request) and device!=request.headers.get('Device-Id'):
+            return self._error('不能更改其他设备的模型',403)
         if not device:
             return self._error("缺少 device", 400)
         merged = await self._blocking(self._merged)
@@ -742,9 +753,9 @@ class AdminHandler:
 
         返回 {"models": {条目名: [{id, role: user|bot, text, time, interrupted}]}}，每个模型最近 limit 条
         （默认 chat_history.display_limit）。"""
-        if not self._from_this_machine(request):
-            return self._error("仅限本机", 403)
         device = request.query.get("device") or ""
+        if not await self._device_scope(request,device):
+            return self._error('需要本机来源或该设备的有效配对令牌',403)
         if not device:
             return self._error("缺少 device", 400)
         cfg = chat_history.settings(await self._blocking(self._merged))
@@ -1288,7 +1299,11 @@ class AdminHandler:
             d["emotion_test"] = self._emotion_progress(d["session_id"])
             # 这台设备此刻在跟谁说话（呼名切到的模型）；和大模型页的全局默认是两回事
             d["model_label"] = llm_router.model_label(d["model"]) if d.get("model") else ""
-        return self._json({"ok": True, "devices": devices, "now": int(time.time()),
+        active_ids = {row['device_id'] for row in devices}
+        screens = sorted(device for device,link in self.speaker_preview.links.items() if not link.ws.closed)
+        devices.extend({'device_id': device, 'session_id': None, 'standby': True}
+                       for device in screens if device not in active_ids)
+        return self._json({"ok": True, "devices": devices, 'screens': screens, "now": int(time.time()),
                            "emotions": [{"emotion": name, "emoji": emoji, "label": catalog.EMOTION_LABELS.get(name, name)}
                                         for emoji, name in EMOJI_MAP.items()]})
 

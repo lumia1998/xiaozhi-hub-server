@@ -293,57 +293,13 @@
 <link rel="stylesheet" href="/admin/assets/stickers-page.css">
 <script src="/admin/assets/memory-page.js"></script>
 <script src="/admin/assets/task-page.js"></script>
+<link rel="stylesheet" href="/admin/assets/console-ui.css">
 </head>
 <body>
 
-<div id="auth" class="auth hidden">
-  <form class="card" id="auth-form">
-    <div class="brand"><div class="logo">🤖</div>小智 Hub 管理后台</div>
-    <input type="text" name="username" value="admin" autocomplete="username" class="hidden" tabindex="-1">
-    <div id="auth-setup" class="hidden">
-      <h2>设置管理后台密码</h2>
-      <p class="muted small">首次使用请设置访问密码（至少 6 位）。设置后，用这个密码登录。</p>
-      <label class="f">密码<input class="in" id="setup-pw" type="password" autocomplete="new-password"></label>
-      <label class="f" style="margin-top:12px">再次输入<input class="in" id="setup-pw2" type="password" autocomplete="new-password"></label>
-    </div>
-    <div id="auth-login" class="hidden">
-      <h2>登录</h2>
-      <p class="muted small">输入管理后台密码。</p>
-      <label class="f">密码<input class="in" id="login-pw" type="password" autocomplete="current-password"></label>
-    </div>
-    <div id="auth-error" class="banner err hidden" style="margin:14px 0 0"></div>
-    <button class="btn primary" id="auth-btn" type="submit" style="width:100%;margin-top:18px">登录</button>
-  </form>
-</div>
-
-<div id="app" class="app hidden">
-  <aside>
-    <div class="brand"><div class="logo">🤖</div><span>小智 Hub</span></div>
-    <nav class="nav" id="nav" aria-label="后台导航">
-      <div class="nav-label">概览</div>
-      <button data-page="status"><span class="ico">◎</span>状态</button>
-      <div class="nav-label">模型与能力</div>
-      <button data-page="llm"><span class="ico">✦</span>大模型</button>
-      <button data-page="skills"><span class="ico"></span>Skill</button>
-      <button data-page="mcp"><span class="ico"></span>MCP</button>
-      <button data-page="stickers"><span class="ico"></span>表情包</button>
-      <button data-page="calls"><span class="ico">☎</span>呼名</button>
-      <button data-page="memory"><span class="ico">✎</span>记忆</button>
-      <button data-page="tasks"><span class="ico">◷</span>任务</button>
-      <div class="nav-label">语音与设备</div>
-      <button data-page="asr"><span class="ico">◐</span>语音识别</button>
-      <button data-page="tts"><span class="ico">♪</span>语音合成</button>
-      <button data-page="intent"><span class="ico">⚙</span>意图识别</button>
-      <div class="nav-label">帮助</div>
-      <button data-page="how"><span class="ico">⇄</span>工作原理</button>
-    </nav>
-    <div class="side-foot"><span class="dot" id="online-dot"></span><span id="online-text">没有设备在线</span><span id="online-short">无设备</span>
-      <div class="row"><button id="logout">退出登录</button>
-        <a href="https://github.com/justhalfbit/xiaozhi-hub-server" target="_blank" rel="noopener" title="xiaozhi-hub-server 开源仓库">GitHub ↗</a></div></div>
-  </aside>
-  <div class="workspace"><header class="workspace-bar"><div class="workspace-breadcrumb"><button class="icon-button" id="nav-toggle" aria-label="展开导航" aria-controls="nav" aria-expanded="false"></button><span>管理后台</span><span aria-hidden="true">/</span><strong id="page-title">状态</strong></div><button class="icon-button" id="theme-toggle" aria-label="切换深浅主题"></button></header><main id="page"></main></div>
-</div>
-<div id="toast"></div>
+<div id="console-ui"></div>
+<div id="toast" role="status"></div>
+<script src="/admin/assets/console-ui.js"></script>
 
 <script>
 "use strict";
@@ -402,80 +358,55 @@ function snapshot(fn) { const first = JSON.stringify(fn()); return () => JSON.st
 
 // ---------- 登录与页面切换 ----------
 
-let authMode = "login";
+const updateShell = HubConsole.mountShell({navigate:openPage,reload:route,
+  submit: async (mode, secret) => { await api(mode, { password:secret }); await route(); },
+  logout: async () => { if (!confirmLeave()) return; page.dirty=null; try {await api('logout',{});await route();} catch(error){toast(error.message,true);} }
+});
 async function route() {
   let st;
-  try { st = await (await fetch("/admin/api/state")).json(); } catch (e) { return; }
+  try { st = await (await fetch("/admin/api/state")).json(); } catch (e) { updateShell({mode:'error'}); return; }
   if (st.needs_setup || !st.logged_in) {
-    authMode = st.needs_setup ? "setup" : "login";
+    if(page.cleanup){page.cleanup();page.cleanup=null;}
     clearInterval(page.timer); page.name = "";
     clearInterval(onlineTimer); onlineTimer = null;
-    $("app").classList.add("hidden"); $("auth").classList.remove("hidden");
-    $("auth-setup").classList.toggle("hidden", authMode !== "setup");
-    $("auth-login").classList.toggle("hidden", authMode !== "login");
-    $("auth-btn").textContent = authMode === "setup" ? "设置并进入" : "登录";
-    $("auth-error").classList.add("hidden");
-    $(authMode === "setup" ? "setup-pw" : "login-pw").focus();
+    updateShell({mode:st.needs_setup?'setup':'login'});
     return;
   }
-  $("auth").classList.add("hidden"); $("app").classList.remove("hidden");
+  updateShell({mode:'app'});
   expiredWarned = false;
   watchOnline();
   await openPage(currentPage(), true);
 }
 
-$("auth-form").addEventListener("submit", async (ev) => {
-  ev.preventDefault();
-  const fail = (msg) => { $("auth-error").textContent = msg; $("auth-error").classList.remove("hidden"); };
-  await busy($("auth-btn"), async () => {
-    try {
-      if (authMode === "setup") {
-        if ($("setup-pw").value.length < 6) return fail("密码至少 6 位");
-        if ($("setup-pw").value !== $("setup-pw2").value) return fail("两次输入的密码不一致");
-        await api("setup", { password: $("setup-pw").value });
-      } else {
-        await api("login", { password: $("login-pw").value });
-        $("login-pw").value = "";
-      }
-      await route();
-    } catch (e) { fail(e.message); }
-  });
-});
-$("logout").onclick = async () => { if (!confirmLeave()) return; page.dirty = null; await api("logout", {}); await route(); };
 
 const PAGES = { status: renderStatus, how: renderHow, llm: renderLLM, skills: root=>renderExtensions(root,'skills'), mcp: root=>renderExtensions(root,'mcp_servers'), stickers: renderStickers, calls: renderCallNames, memory: renderMemory, tasks: renderTasks, asr: renderASR, tts: renderTTS, intent: renderIntent };
 const page = { name: "", dirty: null, timer: null };
+PAGES.speaker = root => { page.cleanup=HubConsole.mountSpeaker(root,api,page); };
 function currentPage() { const p = location.hash.slice(1); return PAGES[p] ? p : "status"; }
 function confirmLeave() { return !(page.dirty && page.dirty()) || confirm("当前页面有修改还没保存，确定离开吗？"); }
 
 async function openPage(name, force) {
-  if (!force && name === page.name) { document.body.classList.remove('nav-open');$('nav-toggle').setAttribute('aria-expanded','false');return; }
+  if (!$("app") || (!force && name===page.name)) return;
   if (!force && !confirmLeave()) { history.replaceState(null, "", "#" + page.name); return; }
   clearInterval(page.timer); page.timer = null; page.dirty = null; page.name = name;
   if (page.cleanup) { page.cleanup(); page.cleanup = null; }
   if (audio) { audio.pause(); audio = null; }
   if (location.hash.slice(1) !== name) history.replaceState(null, "", "#" + name);
-  document.querySelectorAll("#nav button").forEach((b) => b.classList.toggle("active", b.dataset.page === name));
-  document.querySelectorAll('#nav button').forEach(b=>{if(b.dataset.page===name)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current');});
-  $('page-title').textContent=document.querySelector(`#nav [data-page="${name}"]`)?.textContent.trim()||'管理后台';
-  document.body.classList.remove('nav-open');$('nav-toggle').setAttribute('aria-expanded','false');
-  const root = $("page");
+  updateShell({page:name});
+  const root = document.createElement('div');
+  $("page").replaceChildren(root);
   if (!force) root.innerHTML = '<p class="muted">加载中…</p>';
   try { await PAGES[name](root); }
   catch (e) { root.innerHTML = `<div class="banner err">加载失败：${esc(e.message)}</div>`; }
-  if (!force) window.scrollTo(0, 0);
+  if (!force && root.isConnected) window.scrollTo(0, 0);
 }
-document.querySelectorAll("#nav button").forEach((b) => (b.onclick = () => openPage(b.dataset.page)));
 window.addEventListener("hashchange", () => openPage(currentPage()));
 window.addEventListener("beforeunload", (e) => { if (page.dirty && page.dirty()) { e.preventDefault(); e.returnValue = ""; } });
 
 // devices 为 null 表示查不到（连不上服务、登录过期）：不能停在上一次的结果上，否则服务停了还显示"1 台设备在线"
 function setOnline(devices, reason = OFFLINE) {
-  $("online-dot").classList.toggle("on", !!devices && devices.length > 0);
-  $("online-dot").classList.toggle("off", !devices);
-  $("online-text").textContent = !devices ? reason : devices.length ? `${devices.length} 台设备在线` : "没有设备在线";
-  $("online-short").textContent = !devices ? (reason === OFFLINE ? "已断开" : "需登录") : devices.length ? `${devices.length} 台` : "无设备";  // 窄屏用
-  $("online-dot").parentElement.title = $("online-text").textContent;
+  if (devices) devices = [...new Set(devices.map(d => d.device_id || d.session_id))];
+  updateShell({onlineClass: !devices?'off':devices.length?'on':'', online:!devices?reason:devices.length?`${devices.length} 台设备在线`:'没有设备在线'});
 }
 const OFFLINE = "连不上服务";  // api() 连不上服务时抛出的错误以这几个字开头
 const EXPIRED = "登录已过期";
@@ -484,7 +415,7 @@ let expiredWarned = false;
 // 后台定时查询出错时：连不上服务、登录过期（页面上有没保存的修改）都要在侧边栏如实显示
 function onDevicesError(e) {
   if (isOffline(e)) return setOnline(null);
-  if (!e || !e.expired) return;
+  if (!e || !e.expired) return setOnline(null, '设备状态未知');
   setOnline(null, EXPIRED);
   if (!expiredWarned) {
     expiredWarned = true;
@@ -497,7 +428,7 @@ function onDevicesError(e) {
 let onlineTimer = null;
 function watchOnline() {
   const refresh = async () => {
-    if (document.hidden || page.name === "status" || (page.name === "calls" && page.timer)) return;
+    if (document.hidden || (page.name === "status" && page.timer)) return;
     try { setOnline((await api("devices", undefined, true)).devices); } catch (e) { onDevicesError(e); }
   };
   clearInterval(onlineTimer);
@@ -520,39 +451,17 @@ function duration(sec) {
 
 async function renderStatus(root) {
   const [s, dev, tts, pairing] = await Promise.all([api("status"), api("devices"), api("tts"), api("pairing")]);
+  if(page.name!=='status' || !root.isConnected) return;
   setOnline(dev.devices);
   const voice = tts.voices.find((v) => v.value === tts.voice);
-  const tiles = Object.entries(s.modules).map(([k, m]) => {
+  const modules = Object.entries(s.modules).map(([k, m]) => {
     const value = k === "Intent" ? (INTENT_LABEL[m.type] || m.selected) : m.selected;
     const detail = k === "TTS" && voice ? `音色：${voice.name}` : k === "Intent" ? m.selected : m.type;
-    return `<button class="card tile" data-go="${MODULE_PAGES[k]}">
-      <div class="k">${MODULE_TITLES[k]}</div><div class="v">${esc(value)}</div>
-      <div class="d">${m.running && m.running !== m.selected ? `<span class="pill warn">运行中仍是 ${esc(m.running)}</span>` : esc(detail)}</div></button>`;
-  }).join("");
-  const addr = [["本机 IP", s.addresses.ip], ["OTA 地址", s.addresses.ota], ["管理后台", s.addresses.admin]];
-  const levelPill = { ok: '<span class="pill ok">正常</span>', warn: '<span class="pill warn">注意</span>', error: '<span class="pill err">异常</span>' };
-  const bad = s.checks.filter((c) => c.level !== "ok").length;
-  root.innerHTML = `
-    <div class="page-head"><div><h1>状态</h1><p class="sub">服务运行情况、在线设备和连接地址。</p></div>
-      <button class="btn" id="refresh">刷新</button></div>
-    <div class="tiles">${tiles}</div>
-    <div class="section-title">在线设备</div>
-    <div class="card" id="devices"></div>
-    <div class="section-title">设备配对</div>
-    <div class="card panel" id="pairing-panel"></div>
-    <div class="section-title">连接地址</div>
-    <div class="card panel">
-      <p class="muted small" style="margin:0 0 12px">设备配网时填写 OTA 地址。请在路由器里给这台电脑设置固定 IP，否则 IP 变了设备会连不上。</p>
-      <div class="kv">${addr.map(([k, v]) => `<div class="k">${k}</div><code>${esc(v)}</code>
-        <button class="btn sm copy" data-copy="${esc(v)}">复制</button>`).join("")}</div>
-    </div>
-    <div class="section-title">环境自检 ${bad ? `<span class="pill warn">${bad} 项需要注意</span>` : '<span class="pill ok">全部正常</span>'}</div>
-    <div class="card rows">${s.checks.map((c) => `<div><b>${esc(c.name)}</b>${levelPill[c.level] || ""}<span class="muted">${esc(c.detail)}</span></div>`).join("")}</div>`;
-  root.querySelectorAll("[data-go]").forEach((b) => (b.onclick = () => openPage(b.dataset.go)));
-  root.querySelectorAll("[data-copy]").forEach((b) => (b.onclick = () => copyText(b.dataset.copy)));
-  $("refresh").onclick = (e) => busy(e.target, () => openPage("status", true));
-  renderDevices(dev);
-  renderPairing(pairing, dev);
+    const warning = m.running && m.running!==m.selected;
+    return {title:MODULE_TITLES[k],route:MODULE_PAGES[k],value,warning,detail:warning?`运行中仍是 ${m.running}`:detail};
+  });
+  page.cleanup = HubConsole.mountStatus(root,{status:s,modules,open:openPage,refresh:()=>openPage('status',true),
+    copy:copyText,devices:()=>renderDevices(dev),pairing:()=>renderPairing(pairing,dev)});
   // 平时每 5 秒查一次；有设备在做表情测试时每 1.5 秒查一次，让进度跟上设备屏幕
   let last = Date.now();
   page.timer = setInterval(async () => {
@@ -612,13 +521,14 @@ function renderDevices(dev) {
     box.innerHTML = '<div class="panel muted">暂无设备在线。唤醒设备后会自动出现在这里。</div>';
     return;
   }
-  const key = JSON.stringify(dev.devices.map((d) => [d.session_id, d.model_label, d.emotion_test, openEmotion.has(d.session_id)]));  // 设备切了模型也要重绘
+  const key = JSON.stringify(dev.devices.map((d) => [d.device_id,d.session_id, d.model_label, d.emotion_test, openEmotion.has(d.session_id)]));
   if (box.dataset.key === key) {  // 只更新连接时长，避免重绘打断点击
     box.querySelectorAll("[data-since]").forEach((el) => (el.textContent = duration(dev.now - +el.dataset.since)));
     return;
   }
   box.dataset.key = key;
   box.innerHTML = dev.devices.map((d) => {
+    if (d.standby) return `<div class="device"><div class="device-top"><span class="dot on"></span><b>${esc(d.device_id)}</b><span class="pill">待机在线</span></div></div>`;
     const t = d.emotion_test, open = openEmotion.has(d.session_id), running = t && t.running;
     const progress = !t ? "点一个表情单独发送，或者依次播放全部，对照设备屏幕看哪些有变化。"
       : running ? `正在依次播放：第 ${t.index}/${t.total} 个 ${t.emoji} ${esc(t.emotion)}`
@@ -636,7 +546,7 @@ function renderDevices(dev) {
           <button class="btn sm" data-act="stop" ${running ? "" : "disabled"}>停止</button></div>` : ""}
     </div>`;
   }).join("");
-  box.querySelectorAll(".device").forEach((el) => {
+  box.querySelectorAll(".device[data-sid]").forEach((el) => {
     const sid = el.dataset.sid, url = `devices/${encodeURIComponent(sid)}/`;
     const act = (name) => el.querySelector(`[data-act="${name}"]`);
     const refresh = async () => { box.dataset.key = ""; renderDevices(await api("devices")); };
@@ -1132,7 +1042,6 @@ async function renderCallNames(root) {
   let models = d.models.map((m) => ({ ...m, aliases: [...m.aliases] }));
   let learning = d.learning, devices = d.devices;
   const labelOf = (entry) => (d.targets.find((t) => t.entry === entry) || models.find((m) => m.entry === entry) || { label: entry }).label;
-  setOnline(devices);
   root.innerHTML = `
     <div class="page-head"><div><h1>呼名</h1><p class="sub">唤醒设备后，句子开头说“嗨 + 称呼”，就换成对应的模型回答；之后直接说话也交给它，直到叫别的称呼。每个模型只记得跟自己的对话。
       只说称呼时只切换模型、回一声“${esc(d.reply)}”，不发给模型。完整经过见<a href="#how">工作原理</a>。</p></div>
@@ -1246,7 +1155,7 @@ async function renderCallNames(root) {
   const poll = () => {
     clearInterval(page.timer);
     page.timer = setInterval(async () => {
-      try { const r = await api("call-names", undefined, true); learning = r.learning; devices = r.devices; setOnline(devices); } catch (e) { onDevicesError(e); return; }
+      try { const r = await api("call-names", undefined, true); learning = r.learning; devices = r.devices; } catch (e) { onDevicesError(e); return; }
       draw();
       if (!learning.active) { clearInterval(page.timer); page.timer = null; }
     }, 1500);
@@ -1267,6 +1176,5 @@ async function renderCallNames(root) {
 
 route();
 </script>
-<script src="/admin/assets/admin-shell.js"></script>
 </body>
 </html>
